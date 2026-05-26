@@ -21,13 +21,14 @@
 //! is opt-in per deployment via env vars; when unset, the gateway behaves
 //! exactly as today.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use rpv_client::{
-    RpvClientHandle, build_signed_envelope,
+    RpvClientHandle, RpvError, build_signed_envelope,
     proto::{HealthState, RuntimeContextEnvelope},
 };
 use sha2::{Digest, Sha256};
@@ -84,6 +85,11 @@ pub struct RpvShadow {
     enforce: bool,
     dump_projections_dir: Option<PathBuf>,
     client: Mutex<Option<RpvClientHandle>>,
+    /// Per-sandbox handle table. Populated on successful admission,
+    /// read at sandbox deletion to call `ReleaseHandle`. In-memory
+    /// only — gateway restarts forget bindings, which is fine because
+    /// the daemon's handle store is also in-memory.
+    handles: Mutex<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for RpvShadow {
@@ -144,6 +150,7 @@ impl RpvShadow {
             enforce,
             dump_projections_dir,
             client: Mutex::new(None),
+            handles: Mutex::new(HashMap::new()),
         })))
     }
 
@@ -178,7 +185,33 @@ impl RpvShadow {
     /// Run the BindRuntimeContext + GetProjection shadow flow for a
     /// freshly-created sandbox. Logs each step; returns the projection's
     /// `source_bundle_digest` so the caller can stamp it on audit events.
+    ///
+    /// Retry semantics: on a transport-level error from the first
+    /// attempt (typical after the daemon has restarted between
+    /// admissions), the cached UDS client is invalidated and the entire
+    /// admission is retried once with a fresh connection. Application-
+    /// level rejections (`BindRejected`, `GetProjectionRejected`) are
+    /// not retried — they reflect a real Verifier decision.
     pub async fn shadow_admit_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<RpvAdmission, RpvShadowError> {
+        match self.shadow_admit_once(sandbox_id).await {
+            Ok(admission) => Ok(admission),
+            Err(RpvShadowError::Rpv(ref e)) if is_transport_error(e) => {
+                warn!(
+                    sandbox_id,
+                    error = %e,
+                    "rpv-shadow: transport error on admit; invalidating cached client and retrying once"
+                );
+                *self.client.lock().await = None;
+                self.shadow_admit_once(sandbox_id).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn shadow_admit_once(
         &self,
         sandbox_id: &str,
     ) -> Result<RpvAdmission, RpvShadowError> {
@@ -255,12 +288,62 @@ impl RpvShadow {
             }
         }
 
+        // Record the sandbox→handle mapping so a later sandbox-delete
+        // can release the handle without re-binding.
+        {
+            let mut table = self.handles.lock().await;
+            table.insert(sandbox_id.to_string(), bind.handle.clone());
+        }
+
         Ok(RpvAdmission {
             handle: bind.handle,
             source_bundle_digest: proj.source_bundle_digest,
             projection_sha256,
             projection_bytes: proj.projection,
         })
+    }
+
+    /// Release the handle associated with `sandbox_id`. Idempotent —
+    /// returns Ok and logs a debug line if no handle was recorded for
+    /// this sandbox (e.g., the gateway restarted after admission but
+    /// before delete). Called by the sandbox-delete handler.
+    pub async fn shadow_release_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<(), RpvShadowError> {
+        let handle = {
+            let mut table = self.handles.lock().await;
+            table.remove(sandbox_id)
+        };
+        let Some(handle) = handle else {
+            info!(sandbox_id, "rpv-shadow: no handle on record for sandbox; skipping ReleaseHandle");
+            return Ok(());
+        };
+        let mut client = self.connected_client().await?;
+        match client.release_handle(&handle).await {
+            Ok(resp) => {
+                info!(
+                    sandbox_id,
+                    handle = %handle,
+                    was_known = resp.was_known,
+                    "rpv-shadow: handle released"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    sandbox_id,
+                    handle = %handle,
+                    error = %e,
+                    "rpv-shadow: ReleaseHandle RPC failed (handle leaked on daemon side until restart)"
+                );
+                // Invalidate the cached connection so the next call
+                // re-establishes — this is the common path when the
+                // daemon has been restarted between admit and delete.
+                self.invalidate_client_on_transport_error(&e).await;
+                Err(RpvShadowError::Rpv(e))
+            }
+        }
     }
 
     /// Get or establish the cached client connection.
@@ -273,6 +356,35 @@ impl RpvShadow {
             *guard = Some(client);
         }
         Ok(guard.as_ref().unwrap().clone())
+    }
+
+    /// Drop the cached client when a transport-level error suggests the
+    /// underlying UDS connection is no longer usable (daemon restarted,
+    /// socket file replaced, etc.). The next call to `connected_client`
+    /// will re-dial.
+    async fn invalidate_client_on_transport_error(&self, err: &RpvError) {
+        if is_transport_error(err) {
+            *self.client.lock().await = None;
+        }
+    }
+}
+
+/// Heuristic: treat tonic transport errors (connection refused, broken
+/// pipe, peer closed, etc.) as signals to recycle the cached client.
+/// gRPC `Status` errors like `failed_precondition` are NOT transport —
+/// they're application-level rejections and the connection is still
+/// fine.
+fn is_transport_error(err: &RpvError) -> bool {
+    match err {
+        RpvError::Transport(_) | RpvError::Connect(_) => true,
+        RpvError::Call(status) => {
+            // tonic surfaces transport faults as Status::unavailable or
+            // Status::unknown with the original io::Error in the source.
+            matches!(
+                status.code(),
+                tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Cancelled
+            )
+        }
     }
 }
 

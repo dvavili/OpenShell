@@ -457,7 +457,34 @@ pub(super) async fn handle_delete_sandbox(
         return Err(Status::invalid_argument("name is required"));
     }
 
+    // Capture the sandbox UUID *before* compute deletion so we can call
+    // RPV `ReleaseHandle` afterwards. The store lookup is best-effort:
+    // if the sandbox doesn't exist, compute.delete_sandbox will surface
+    // the not-found error, and we won't have a handle to release anyway.
+    let sandbox_id = state
+        .store
+        .get_message_by_name::<Sandbox>(&name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .and_then(|s| s.metadata.map(|m| m.id));
+
     let deleted = state.compute.delete_sandbox(&name).await?;
+
+    // APF RPV handle release. Best-effort even in enforce mode — the
+    // sandbox is already gone; failing the DeleteSandbox RPC over a
+    // leaked Verifier handle would punish callers for the integration's
+    // own state-tracking limitations.
+    if let (Some(shadow), Some(id)) = (state.rpv_shadow.as_ref(), sandbox_id.as_deref()) {
+        if let Err(e) = shadow.shadow_release_sandbox(id).await {
+            warn!(
+                sandbox_id = %id,
+                sandbox_name = %name,
+                error = %e,
+                "rpv-shadow: handle release failed (handle leaked on daemon side until restart)"
+            );
+        }
+    }
+
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse { deleted }))
 }
