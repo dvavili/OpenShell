@@ -51,6 +51,26 @@ const ENV_SIGNING_KEY: &str = "OPENSHELL_RPV_GATEWAY_SIGNING_KEY";
 /// `"unknown@workspace.local"` and logs a warning.
 const ENV_USER_SUBJECT: &str = "OPENSHELL_RPV_USER_SUBJECT";
 
+/// Env var that, when set to a truthy value (`1`, `true`, `yes`),
+/// switches the integration from shadow to **enforce**. In enforce
+/// mode:
+///   - A failed Health probe at gateway startup is fatal — the
+///     gateway refuses to come up.
+///   - A failed `BindRuntimeContext` / `GetProjection` at sandbox
+///     admission returns an error to the CreateSandbox caller, refusing
+///     admission.
+/// When unset/false the integration runs in shadow mode: failures are
+/// logged and sandbox creation proceeds (the default and current safe
+/// rollout posture).
+const ENV_ENFORCE: &str = "OPENSHELL_RPV_ENFORCE";
+
+/// Env var pointing at a directory to write each admission's
+/// projection bytes into. When set, every successful
+/// `shadow_admit_sandbox` writes `<dir>/<sandbox_id>.yaml` with the
+/// projection RPV vended. Optional — used for inspection / debugging
+/// of what RPV would return per sandbox.
+const ENV_DUMP_PROJECTIONS_DIR: &str = "OPENSHELL_RPV_DUMP_PROJECTIONS_DIR";
+
 const OPENSHELL_SURFACE_ID: &str = "openshell.substrate.v1";
 
 /// Configured shadow integration. Constructed at gateway startup; if any
@@ -60,6 +80,8 @@ pub struct RpvShadow {
     socket_path: PathBuf,
     signing_key: SigningKey,
     user_subject: String,
+    enforce: bool,
+    dump_projections_dir: Option<PathBuf>,
     client: Mutex<Option<RpvClientHandle>>,
 }
 
@@ -68,6 +90,8 @@ impl std::fmt::Debug for RpvShadow {
         f.debug_struct("RpvShadow")
             .field("socket_path", &self.socket_path)
             .field("user_subject", &self.user_subject)
+            .field("enforce", &self.enforce)
+            .field("dump_projections_dir", &self.dump_projections_dir)
             .finish_non_exhaustive()
     }
 }
@@ -98,12 +122,37 @@ impl RpvShadow {
             "unknown@workspace.local".to_string()
         });
 
+        let enforce = std::env::var(ENV_ENFORCE)
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        let dump_projections_dir = std::env::var_os(ENV_DUMP_PROJECTIONS_DIR).map(PathBuf::from);
+        if let Some(dir) = &dump_projections_dir {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                return Err(RpvShadowError::Misconfigured(format!(
+                    "{ENV_DUMP_PROJECTIONS_DIR}={}: create_dir_all failed: {e}",
+                    dir.display()
+                )));
+            }
+        }
+
         Ok(Some(Arc::new(Self {
             socket_path,
             signing_key,
             user_subject,
+            enforce,
+            dump_projections_dir,
             client: Mutex::new(None),
         })))
+    }
+
+    /// Whether the integration is configured to fail-closed on RPV
+    /// failure. Callers (e.g. the sandbox-create handler) should refuse
+    /// admission when an admission attempt errors and this is true;
+    /// log-and-continue when this is false.
+    #[must_use]
+    pub fn enforce(&self) -> bool {
+        self.enforce
     }
 
     /// Probe the RPV daemon's health. Called at gateway startup; the
@@ -180,6 +229,24 @@ impl RpvShadow {
             projection_bytes = proj.projection.len(),
             "rpv-shadow: projection vended"
         );
+
+        if let Some(dir) = &self.dump_projections_dir {
+            let dump_path = dir.join(format!("{sandbox_id}.yaml"));
+            match std::fs::write(&dump_path, &proj.projection) {
+                Ok(()) => info!(
+                    sandbox_id,
+                    path = %dump_path.display(),
+                    bytes = proj.projection.len(),
+                    "rpv-shadow: projection dumped"
+                ),
+                Err(e) => warn!(
+                    sandbox_id,
+                    path = %dump_path.display(),
+                    error = %e,
+                    "rpv-shadow: projection dump failed (admission still succeeds)"
+                ),
+            }
+        }
 
         Ok(RpvAdmission {
             handle: bind.handle,

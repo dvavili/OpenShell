@@ -338,15 +338,26 @@ pub async fn run_server(
         }
     }
 
-    // APF Runtime Policy Verifier shadow integration. Opt-in via env vars
+    // APF Runtime Policy Verifier integration. Opt-in via env vars
     // (see `rpv_shadow::RpvShadow::from_env`). When configured, probe
-    // Health at startup; fail-soft (log + disable) on probe failure so a
-    // misconfigured shadow doesn't take the gateway down.
+    // Health at startup. In shadow mode (default) a probe failure
+    // disables the integration but the gateway continues. In enforce
+    // mode (OPENSHELL_RPV_ENFORCE=true) a probe failure is fatal — the
+    // gateway refuses to come up, since enforce mode promises that no
+    // sandbox is admitted without Verifier sign-off.
     match rpv_shadow::RpvShadow::from_env() {
         Ok(Some(shadow)) => match shadow.probe_health().await {
             Ok(()) => {
-                info!("rpv-shadow: enabled and healthy");
+                info!(
+                    enforce = shadow.enforce(),
+                    "rpv-shadow: enabled and healthy"
+                );
                 state.rpv_shadow = Some(shadow);
+            }
+            Err(e) if shadow.enforce() => {
+                return Err(Error::config(format!(
+                    "rpv-shadow: enforce mode but health probe failed at startup: {e}"
+                )));
             }
             Err(e) => warn!(
                 error = %e,

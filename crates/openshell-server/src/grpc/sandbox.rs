@@ -124,13 +124,16 @@ pub(super) async fn handle_create_sandbox(
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
 
-    // APF RPV shadow admission. When the rpv-shadow integration is
-    // configured, attest the sandbox identity to the Verifier via a
-    // signed runtime-context envelope and fetch the projection it would
-    // serve. Runs before any compute-driver interaction: in enforcement
-    // mode the bundle's policy decision must gate compute admission, not
-    // the other way around. Shadow-only today — result is logged, not
-    // enforced — so RPV failures do not block sandbox creation.
+    // APF RPV admission. When the rpv-shadow integration is configured,
+    // attest the sandbox identity to the Verifier via a signed
+    // runtime-context envelope and fetch the projection it would serve.
+    // Runs before any compute-driver interaction: in enforce mode the
+    // bundle's policy decision must gate compute admission, not the
+    // other way around.
+    //
+    // Mode controlled by OPENSHELL_RPV_ENFORCE on the gateway:
+    //   - shadow (default): on failure, log warn and continue;
+    //   - enforce: on failure, refuse CreateSandbox with FailedPrecondition.
     if let Some(shadow) = state.rpv_shadow.as_ref() {
         match shadow.shadow_admit_sandbox(&id).await {
             Ok(admission) => info!(
@@ -138,12 +141,23 @@ pub(super) async fn handle_create_sandbox(
                 rpv_handle = %admission.handle,
                 source_bundle_digest = %admission.source_bundle_digest,
                 projection_bytes = admission.projection_bytes.len(),
-                "rpv-shadow: shadow admission completed"
+                enforce = shadow.enforce(),
+                "rpv-shadow: admission completed"
             ),
+            Err(e) if shadow.enforce() => {
+                warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "rpv-shadow: admission rejected in enforce mode; refusing CreateSandbox"
+                );
+                return Err(Status::failed_precondition(format!(
+                    "rpv admission rejected: {e}"
+                )));
+            }
             Err(e) => warn!(
                 sandbox_id = %id,
                 error = %e,
-                "rpv-shadow: shadow admission failed (sandbox creation proceeds)"
+                "rpv-shadow: admission failed in shadow mode (sandbox creation proceeds)"
             ),
         }
     }
