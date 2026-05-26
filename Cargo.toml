@@ -113,6 +113,10 @@ k8s-openapi = { version = "0.21.1", features = ["v1_26"] }
 # IDs
 uuid = { version = "1.10", features = ["v4"] }
 
+# Ed25519 signing — used by the APF RPV shadow integration for runtime-
+# context envelope signing.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
 # SMT solver (uses system libz3; enable z3/bundled via the prover's bundled-z3 feature for local dev without system z3)
 z3 = "0.19"
 

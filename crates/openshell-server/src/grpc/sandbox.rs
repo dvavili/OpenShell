@@ -153,6 +153,27 @@ pub(super) async fn handle_create_sandbox(
         None => None,
     };
 
+    // APF RPV shadow admission. When the rpv-shadow integration is
+    // configured, attest the sandbox identity to the Verifier via a
+    // signed runtime-context envelope and fetch the projection it would
+    // serve. Shadow-only — result is logged, not enforced.
+    if let Some(shadow) = state.rpv_shadow.as_ref() {
+        match shadow.shadow_admit_sandbox(&id).await {
+            Ok(admission) => info!(
+                sandbox_id = %id,
+                rpv_handle = %admission.handle,
+                source_bundle_digest = %admission.source_bundle_digest,
+                projection_bytes = admission.projection_bytes.len(),
+                "rpv-shadow: shadow admission completed"
+            ),
+            Err(e) => warn!(
+                sandbox_id = %id,
+                error = %e,
+                "rpv-shadow: shadow admission failed (sandbox creation proceeds)"
+            ),
+        }
+    }
+
     let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
     info!(

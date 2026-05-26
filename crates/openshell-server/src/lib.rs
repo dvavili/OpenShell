@@ -33,6 +33,7 @@ mod persistence;
 pub(crate) mod policy_store;
 mod provider_refresh;
 mod readiness;
+pub mod rpv_shadow;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
@@ -128,6 +129,12 @@ pub struct ServerState {
     /// `IssueSandboxToken` bootstrap path. Only present when the gateway
     /// runs in-cluster.
     pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
+
+    /// Optional APF Runtime Policy Verifier shadow integration. When set,
+    /// the gateway makes BindRuntimeContext + GetProjection shadow calls
+    /// at sandbox admission. See [`rpv_shadow`] and the OpenShell RFC
+    /// "Attested Policy Projection".
+    pub rpv_shadow: Option<Arc<rpv_shadow::RpvShadow>>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -175,6 +182,7 @@ impl ServerState {
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
+            rpv_shadow: None,
         }
     }
 }
@@ -328,6 +336,25 @@ pub async fn run_server(
                  K8s ServiceAccount bootstrap is disabled"
             ),
         }
+    }
+
+    // APF Runtime Policy Verifier shadow integration. Opt-in via env vars
+    // (see `rpv_shadow::RpvShadow::from_env`). When configured, probe
+    // Health at startup; fail-soft (log + disable) on probe failure so a
+    // misconfigured shadow doesn't take the gateway down.
+    match rpv_shadow::RpvShadow::from_env() {
+        Ok(Some(shadow)) => match shadow.probe_health().await {
+            Ok(()) => {
+                info!("rpv-shadow: enabled and healthy");
+                state.rpv_shadow = Some(shadow);
+            }
+            Err(e) => warn!(
+                error = %e,
+                "rpv-shadow: probe failed at startup; integration disabled for this run"
+            ),
+        },
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "rpv-shadow: configuration error; integration disabled"),
     }
 
     let state = Arc::new(state);

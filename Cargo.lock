@@ -3691,8 +3691,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.8.9",
+ "base64 0.22.1",
  "bytes",
  "clap",
+ "ed25519-dalek",
  "futures",
  "futures-util",
  "hex",
@@ -3726,6 +3728,7 @@ dependencies = [
  "rand 0.9.4",
  "rcgen",
  "reqwest 0.12.28",
+ "rpv-client",
  "russh",
  "rustix 1.1.4",
  "rustls",
@@ -4710,6 +4713,31 @@ dependencies = [
  "hashbrown 0.14.5",
  "rustc-hash 1.1.0",
  "text-size",
+]
+
+[[package]]
+name = "rpv-client"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "hyper-util",
+ "prost",
+ "rpv-proto",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
+]
+
+[[package]]
+name = "rpv-proto"
+version = "0.0.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]

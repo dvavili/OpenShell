@@ -25,6 +25,12 @@ openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
 
+# APF Runtime Policy Verifier — shadow integration for the OpenShell
+# Attested Policy Projection RFC. Path dep on the sibling repo for now.
+rpv-client = { path = "../../../agent-policy-fabric/runtime-policy-verifier/crates/rpv-client" }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+
 # Kubernetes client (used by the `generate-certs` subcommand)
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
