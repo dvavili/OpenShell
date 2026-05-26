@@ -30,6 +30,7 @@ use rpv_client::{
     RpvClientHandle, build_signed_envelope,
     proto::{HealthState, RuntimeContextEnvelope},
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -220,10 +221,16 @@ impl RpvShadow {
             );
             return Err(RpvShadowError::GetProjectionRejected(proj.rejection_reasons));
         }
+        let projection_sha256 = {
+            let mut h = Sha256::new();
+            h.update(&proj.projection);
+            hex::encode(h.finalize())
+        };
         info!(
             sandbox_id,
             handle = %bind.handle,
             source_bundle_digest = %proj.source_bundle_digest,
+            projection_sha256 = %projection_sha256,
             surface_id = %proj.surface_id,
             schema = %proj.projection_schema_version,
             projection_bytes = proj.projection.len(),
@@ -251,6 +258,7 @@ impl RpvShadow {
         Ok(RpvAdmission {
             handle: bind.handle,
             source_bundle_digest: proj.source_bundle_digest,
+            projection_sha256,
             projection_bytes: proj.projection,
         })
     }
@@ -274,7 +282,15 @@ impl RpvShadow {
 #[derive(Debug, Clone)]
 pub struct RpvAdmission {
     pub handle: String,
+    /// SHA-256 of the *source bundle* (lowercase hex). Returned by the
+    /// Verifier; ties projection back to a specific signed bundle.
     pub source_bundle_digest: String,
+    /// SHA-256 of the *projection bytes themselves* (lowercase hex).
+    /// Computed gateway-side over `projection_bytes`. Changes whenever
+    /// the daemon vends different content — useful for spotting bundle
+    /// rotations (where the bundle digest changes) vs in-daemon
+    /// projection swaps (where only this digest changes).
+    pub projection_sha256: String,
     pub projection_bytes: Vec<u8>,
 }
 

@@ -140,6 +140,7 @@ pub(super) async fn handle_create_sandbox(
                 sandbox_id = %id,
                 rpv_handle = %admission.handle,
                 source_bundle_digest = %admission.source_bundle_digest,
+                projection_sha256 = %admission.projection_sha256,
                 projection_bytes = admission.projection_bytes.len(),
                 enforce = shadow.enforce(),
                 "rpv-shadow: admission completed"
