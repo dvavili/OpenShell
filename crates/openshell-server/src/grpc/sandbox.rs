@@ -124,6 +124,30 @@ pub(super) async fn handle_create_sandbox(
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
 
+    // APF RPV shadow admission. When the rpv-shadow integration is
+    // configured, attest the sandbox identity to the Verifier via a
+    // signed runtime-context envelope and fetch the projection it would
+    // serve. Runs before any compute-driver interaction: in enforcement
+    // mode the bundle's policy decision must gate compute admission, not
+    // the other way around. Shadow-only today — result is logged, not
+    // enforced — so RPV failures do not block sandbox creation.
+    if let Some(shadow) = state.rpv_shadow.as_ref() {
+        match shadow.shadow_admit_sandbox(&id).await {
+            Ok(admission) => info!(
+                sandbox_id = %id,
+                rpv_handle = %admission.handle,
+                source_bundle_digest = %admission.source_bundle_digest,
+                projection_bytes = admission.projection_bytes.len(),
+                "rpv-shadow: shadow admission completed"
+            ),
+            Err(e) => warn!(
+                sandbox_id = %id,
+                error = %e,
+                "rpv-shadow: shadow admission failed (sandbox creation proceeds)"
+            ),
+        }
+    }
+
     state
         .compute
         .validate_sandbox_create(&sandbox)
@@ -152,27 +176,6 @@ pub(super) async fn handle_create_sandbox(
         Some(Err(status)) => return Err(status),
         None => None,
     };
-
-    // APF RPV shadow admission. When the rpv-shadow integration is
-    // configured, attest the sandbox identity to the Verifier via a
-    // signed runtime-context envelope and fetch the projection it would
-    // serve. Shadow-only — result is logged, not enforced.
-    if let Some(shadow) = state.rpv_shadow.as_ref() {
-        match shadow.shadow_admit_sandbox(&id).await {
-            Ok(admission) => info!(
-                sandbox_id = %id,
-                rpv_handle = %admission.handle,
-                source_bundle_digest = %admission.source_bundle_digest,
-                projection_bytes = admission.projection_bytes.len(),
-                "rpv-shadow: shadow admission completed"
-            ),
-            Err(e) => warn!(
-                sandbox_id = %id,
-                error = %e,
-                "rpv-shadow: shadow admission failed (sandbox creation proceeds)"
-            ),
-        }
-    }
 
     let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
