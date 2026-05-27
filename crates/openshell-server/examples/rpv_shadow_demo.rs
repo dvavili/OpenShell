@@ -13,7 +13,7 @@
 //!
 //! Run with:
 //!     OPENSHELL_RPV_SOCKET=/tmp/rpv-demo.sock \
-//!     OPENSHELL_RPV_GATEWAY_SIGNING_KEY=/path/to/gateway-pv-dev.key \
+//!     OPENSHELL_RPV_GATEWAY_SIGNING_KEY=/path/to/gateway-pv-dev.signing-key \
 //!     OPENSHELL_RPV_USER_SUBJECT=dvavili@nvidia.com \
 //!     cargo run --release --example rpv_shadow_demo -p openshell-server
 
