@@ -30,7 +30,13 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
-pub(crate) mod policy_provider;
+// Public so the OpenShell-owned `openshell.policy.v1alpha1.Engine` test
+// fixture (`openshell-policy-engine-null`) can share the canonical
+// `canonical_projection_bytes` helper and `ProjectionEnvelope` mirror
+// shape with the `AttestedPolicyProvider` verify path, and so cross-crate
+// integration tests can construct an `AttestedPolicyProvider`
+// programmatically.
+pub mod policy_provider;
 pub(crate) mod policy_store;
 mod provider_refresh;
 mod readiness;

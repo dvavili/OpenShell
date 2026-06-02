@@ -28,7 +28,9 @@ use crate::persistence::PersistenceError;
 
 pub use attested::AttestedPolicyProvider;
 pub use local::LocalPolicyProvider;
-pub use source::{GrpcPolicySource, PolicySourceError};
+pub use source::{
+    canonical_projection_bytes, GrpcPolicySource, PolicySourceError, ProjectionEnvelope,
+};
 pub use trust_store::TrustStore;
 
 /// Policy-type id for the in-process, store-backed policy provider.
