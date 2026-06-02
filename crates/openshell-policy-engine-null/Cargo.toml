@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-policy-engine-null"
+description = "Null reference Engine for the openshell.policy.v1alpha1 wire — Gateway-side test fixture only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-policy-engine-null"
+path = "src/main.rs"
+
+[dependencies]
+# openshell-server re-exports `canonical_projection_bytes` and
+# `ProjectionEnvelope` (gateway-internal mirror of the wire envelope) so
+# the null engine and the AttestedPolicyProvider sign + verify against
+# the same canonical byte order. See the policy_provider/source.rs
+# canonical-bytes helper.
+openshell-core = { path = "../openshell-core" }
+openshell-policy = { path = "../openshell-policy" }
+openshell-server = { path = "../openshell-server" }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
+prost = { workspace = true }
+
+# Service plumbing
+tower = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio"] }
+
+# CLI
+clap = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Crypto
+ed25519-dalek = { workspace = true }
+# rand_core 0.6 because ed25519-dalek v2 still consumes that trait surface
+# for SigningKey::generate. Matches openshell-server's pin.
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
+rand = { workspace = true }
+sha2 = { workspace = true }
+
+# Async trait
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

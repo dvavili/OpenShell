@@ -3597,6 +3597,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-policy-engine-null"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "ed25519-dalek",
+ "hyper-util",
+ "openshell-core",
+ "openshell-policy",
+ "openshell-server",
+ "prost",
+ "rand 0.9.4",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-prover"
 version = "0.0.0"
 dependencies = [
