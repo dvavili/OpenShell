@@ -92,6 +92,21 @@ const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
 
+/// Operator-facing refusal returned when the active driver does not permit
+/// mutation.
+const POLICY_MUTATION_DISABLED_MSG: &str =
+    "policy mutation is disabled: the active policy driver does not permit mutation";
+
+/// Refuse the policy-mutation surface when the active driver does not permit
+/// mutation. Returns `Ok(())` when mutation is permitted.
+fn ensure_policy_mutation_permitted(state: &ServerState) -> Result<(), Status> {
+    if state.policy.permits_mutation() {
+        Ok(())
+    } else {
+        Err(Status::unimplemented(POLICY_MUTATION_DISABLED_MSG))
+    }
+}
+
 fn emit_sandbox_policy_update_success() {
     openshell_core::telemetry::emit_lifecycle(
         LifecycleResource::SandboxPolicy,
@@ -1484,6 +1499,13 @@ async fn handle_update_config_inner(
         ));
     }
 
+    // Gate only policy mutations; non-policy settings writes pass through.
+    let is_policy_mutation =
+        has_policy || has_merge_ops || (key == POLICY_SETTING_KEY && req.delete_setting);
+    if is_policy_mutation {
+        ensure_policy_mutation_permitted(state)?;
+    }
+
     if req.global {
         let _settings_guard = state.settings_mutex.lock().await;
 
@@ -2186,6 +2208,7 @@ pub(super) async fn handle_submit_policy_analysis(
         .get::<Principal>()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
+    ensure_policy_mutation_permitted(state)?;
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -2452,6 +2475,7 @@ pub(super) async fn handle_get_draft_policy(
         .get::<Principal>()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
+    ensure_policy_mutation_permitted(state)?;
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -2505,6 +2529,7 @@ pub(super) async fn handle_approve_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
+    ensure_policy_mutation_permitted(state)?;
     let result = handle_approve_draft_chunk_inner(state, request).await;
     if result.is_err() {
         emit_policy_decision_failure(PolicyDecisionOperation::Approve, 1);
@@ -2605,6 +2630,7 @@ pub(super) async fn handle_reject_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
+    ensure_policy_mutation_permitted(state)?;
     let result = handle_reject_draft_chunk_inner(state, request).await;
     if result.is_err() {
         emit_policy_decision_failure(PolicyDecisionOperation::Reject, 1);
@@ -2702,6 +2728,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
     state: &Arc<ServerState>,
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
+    ensure_policy_mutation_permitted(state)?;
     let result = handle_approve_all_draft_chunks_inner(state, request).await;
     if result.is_err() {
         emit_policy_decision_failure(PolicyDecisionOperation::ApproveAll, 0);
@@ -2834,6 +2861,7 @@ pub(super) async fn handle_edit_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<EditDraftChunkRequest>,
 ) -> Result<Response<EditDraftChunkResponse>, Status> {
+    ensure_policy_mutation_permitted(state)?;
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -2887,6 +2915,7 @@ pub(super) async fn handle_undo_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
+    ensure_policy_mutation_permitted(state)?;
     let result = handle_undo_draft_chunk_inner(state, request).await;
     if result.is_err() {
         emit_policy_decision_failure(PolicyDecisionOperation::Undo, 1);
@@ -2983,6 +3012,7 @@ pub(super) async fn handle_clear_draft_chunks(
     state: &Arc<ServerState>,
     request: Request<ClearDraftChunksRequest>,
 ) -> Result<Response<ClearDraftChunksResponse>, Status> {
+    ensure_policy_mutation_permitted(state)?;
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -3019,6 +3049,7 @@ pub(super) async fn handle_get_draft_history(
     state: &Arc<ServerState>,
     request: Request<GetDraftHistoryRequest>,
 ) -> Result<Response<GetDraftHistoryResponse>, Status> {
+    ensure_policy_mutation_permitted(state)?;
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -9655,5 +9686,376 @@ mod tests {
             final_sandbox.spec.as_ref().unwrap().policy.is_some(),
             "policy should be backfilled after one success"
         );
+    }
+
+    mod mutation_gate {
+        use super::*;
+        use crate::policy::{
+            EffectivePolicy, PolicyDriver, PolicyError, PolicyRequest, PolicyResolver,
+        };
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        /// Driver that reports `permits_mutation() == false` so the gate
+        /// fires. It binds no socket and serves no policy.
+        #[derive(Debug)]
+        struct NonMutatingTestDriver;
+
+        #[async_trait::async_trait]
+        impl PolicyDriver for NonMutatingTestDriver {
+            fn name(&self) -> &str {
+                const NAME: &str = "test-non-mutating";
+                NAME
+            }
+
+            async fn effective_policy(
+                &self,
+                _request: PolicyRequest<'_>,
+            ) -> Result<EffectivePolicy, PolicyError> {
+                Ok(EffectivePolicy::default())
+            }
+
+            fn permits_mutation(&self) -> bool {
+                false
+            }
+        }
+
+        /// Build a server state whose policy driver does not permit mutation.
+        async fn non_mutating_state() -> Arc<ServerState> {
+            let mut state = test_server_state().await;
+            let resolver = PolicyResolver::new(Arc::new(NonMutatingTestDriver), Vec::new());
+            Arc::get_mut(&mut state)
+                .expect("fresh state is uniquely owned")
+                .policy = resolver;
+            state
+        }
+
+        async fn seed_sandbox(state: &Arc<ServerState>, id: &str, name: &str) {
+            let mut sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    policy: None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn submit_policy_analysis_refused() {
+            let state = non_mutating_state().await;
+            let err = handle_submit_policy_analysis(
+                &state,
+                with_user(Request::new(SubmitPolicyAnalysisRequest {
+                    name: "sandbox-a".to_string(),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect_err("mutation must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn approve_draft_chunk_refused() {
+            let state = non_mutating_state().await;
+            let err = handle_approve_draft_chunk(
+                &state,
+                with_user(Request::new(ApproveDraftChunkRequest {
+                    name: "sandbox-a".to_string(),
+                    chunk_id: "chunk-1".to_string(),
+                })),
+            )
+            .await
+            .expect_err("mutation must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn reject_draft_chunk_refused() {
+            let state = non_mutating_state().await;
+            let err = handle_reject_draft_chunk(
+                &state,
+                with_user(Request::new(RejectDraftChunkRequest {
+                    name: "sandbox-a".to_string(),
+                    chunk_id: "chunk-1".to_string(),
+                    reason: String::new(),
+                })),
+            )
+            .await
+            .expect_err("mutation must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn approve_all_draft_chunks_refused() {
+            let state = non_mutating_state().await;
+            let err = handle_approve_all_draft_chunks(
+                &state,
+                with_user(Request::new(ApproveAllDraftChunksRequest {
+                    name: "sandbox-a".to_string(),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect_err("mutation must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn edit_draft_chunk_refused() {
+            let state = non_mutating_state().await;
+            let err = handle_edit_draft_chunk(
+                &state,
+                with_user(Request::new(EditDraftChunkRequest {
+                    name: "sandbox-a".to_string(),
+                    chunk_id: "chunk-1".to_string(),
+                    proposed_rule: None,
+                })),
+            )
+            .await
+            .expect_err("mutation must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn undo_draft_chunk_refused() {
+            let state = non_mutating_state().await;
+            let err = handle_undo_draft_chunk(
+                &state,
+                with_user(Request::new(UndoDraftChunkRequest {
+                    name: "sandbox-a".to_string(),
+                    chunk_id: "chunk-1".to_string(),
+                })),
+            )
+            .await
+            .expect_err("mutation must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn clear_draft_chunks_refused() {
+            let state = non_mutating_state().await;
+            let err = handle_clear_draft_chunks(
+                &state,
+                with_user(Request::new(ClearDraftChunksRequest {
+                    name: "sandbox-a".to_string(),
+                })),
+            )
+            .await
+            .expect_err("mutation must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn get_draft_policy_refused() {
+            let state = non_mutating_state().await;
+            let err = handle_get_draft_policy(
+                &state,
+                with_user(Request::new(GetDraftPolicyRequest {
+                    name: "sandbox-a".to_string(),
+                    status_filter: String::new(),
+                })),
+            )
+            .await
+            .expect_err("draft read must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn get_draft_history_refused() {
+            let state = non_mutating_state().await;
+            let err = handle_get_draft_history(
+                &state,
+                with_user(Request::new(GetDraftHistoryRequest {
+                    name: "sandbox-a".to_string(),
+                })),
+            )
+            .await
+            .expect_err("draft read must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn update_config_policy_payload_refused() {
+            let state = non_mutating_state().await;
+            seed_sandbox(&state, "sb-a", "sandbox-a").await;
+            let err = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: "sandbox-a".to_string(),
+                    policy: Some(ProtoSandboxPolicy::default()),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect_err("policy mutation must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn update_config_merge_operations_refused() {
+            let state = non_mutating_state().await;
+            seed_sandbox(&state, "sb-a", "sandbox-a").await;
+            let err = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    name: "sandbox-a".to_string(),
+                    merge_operations: vec![PolicyMergeOperation::default()],
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect_err("policy merge must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn update_config_policy_delete_refused() {
+            let state = non_mutating_state().await;
+            let err = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    global: true,
+                    setting_key: POLICY_SETTING_KEY.to_string(),
+                    delete_setting: true,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect_err("policy delete must be refused");
+            assert_eq!(err.code(), Code::Unimplemented);
+        }
+
+        #[tokio::test]
+        async fn update_config_non_policy_setting_passes_through() {
+            let state = non_mutating_state().await;
+            handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    global: true,
+                    setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    setting_value: Some(SettingValue {
+                        value: Some(setting_value::Value::BoolValue(true)),
+                    }),
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect("non-policy setting write must pass through the gate");
+        }
+    }
+
+    /// Every `openshell.v1.OpenShell` RPC must be classified as either a
+    /// policy-mutation RPC or not. A newly added RPC that is in neither set
+    /// fails the test, forcing a classification decision so the
+    /// policy-mutation surface cannot silently grow.
+    mod mutation_classification {
+        use prost::Message;
+        use prost_types::FileDescriptorSet;
+
+        /// RPCs gated by the policy-mutation guard: the seven draft-chunk
+        /// mutations, the two draft reads, and `UpdateConfig` (gated in its
+        /// body only for policy branches).
+        const POLICY_MUTATION_GATED: &[&str] = &[
+            "SubmitPolicyAnalysis",
+            "ApproveDraftChunk",
+            "RejectDraftChunk",
+            "ApproveAllDraftChunks",
+            "EditDraftChunk",
+            "UndoDraftChunk",
+            "ClearDraftChunks",
+            "GetDraftPolicy",
+            "GetDraftHistory",
+            "UpdateConfig",
+        ];
+
+        /// Every other `OpenShell` RPC: reads, sandbox and service lifecycle,
+        /// provider management, supervisor relay, tokens, logs, and status
+        /// reporting. These remain callable under a non-mutating driver.
+        const NOT_POLICY_MUTATION: &[&str] = &[
+            "Health",
+            "CreateSandbox",
+            "GetSandbox",
+            "ListSandboxes",
+            "ListSandboxProviders",
+            "AttachSandboxProvider",
+            "DetachSandboxProvider",
+            "DeleteSandbox",
+            "CreateSshSession",
+            "ExposeService",
+            "GetService",
+            "ListServices",
+            "DeleteService",
+            "RevokeSshSession",
+            "ExecSandbox",
+            "ForwardTcp",
+            "ExecSandboxInteractive",
+            "CreateProvider",
+            "GetProvider",
+            "ListProviders",
+            "ListProviderProfiles",
+            "GetProviderProfile",
+            "ImportProviderProfiles",
+            "LintProviderProfiles",
+            "UpdateProvider",
+            "GetProviderRefreshStatus",
+            "ConfigureProviderRefresh",
+            "RotateProviderCredential",
+            "DeleteProviderRefresh",
+            "DeleteProvider",
+            "DeleteProviderProfile",
+            "GetSandboxConfig",
+            "GetGatewayConfig",
+            "GetSandboxPolicyStatus",
+            "ListSandboxPolicies",
+            "ReportPolicyStatus",
+            "GetSandboxProviderEnvironment",
+            "GetSandboxLogs",
+            "PushSandboxLogs",
+            "ConnectSupervisor",
+            "RelayStream",
+            "WatchSandbox",
+            "IssueSandboxToken",
+            "RefreshSandboxToken",
+        ];
+
+        #[test]
+        fn every_openshell_rpc_is_classified() {
+            let set = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)
+                .expect("decode descriptor set");
+
+            let mut unclassified: Vec<String> = Vec::new();
+            for file in &set.file {
+                if file.package.as_deref() != Some("openshell.v1") {
+                    continue;
+                }
+                for svc in &file.service {
+                    if svc.name.as_deref() != Some("OpenShell") {
+                        continue;
+                    }
+                    for method in &svc.method {
+                        let name = method.name.as_deref().unwrap_or("");
+                        let gated = POLICY_MUTATION_GATED.contains(&name);
+                        let not_gated = NOT_POLICY_MUTATION.contains(&name);
+                        if gated == not_gated {
+                            unclassified.push(name.to_string());
+                        }
+                    }
+                }
+            }
+
+            assert!(
+                unclassified.is_empty(),
+                "OpenShell RPCs not classified into exactly one mutation set: {unclassified:?}"
+            );
+        }
     }
 }
