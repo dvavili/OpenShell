@@ -253,12 +253,17 @@ pub async fn run_server(
         .as_ref()
         .and_then(|file| file.openshell.gateway.policy.clone())
         .unwrap_or_default();
-    let policy_driver = policy::resolve_policy_driver(
-        &policy_config.accepted_surfaces,
-        policy_config.driver_socket.as_deref(),
-        store.clone(),
-    )
-    .map_err(|e| Error::config(e.to_string()))?;
+    let policy_driver = match policy_config.driver_socket.as_deref() {
+        None => {
+            policy::resolve_policy_driver(&policy_config.accepted_surfaces, None, store.clone())
+                .map_err(|e| Error::config(e.to_string()))?
+        }
+        Some(socket) => {
+            policy::connect_external_policy_driver(socket, &policy_config.accepted_surfaces)
+                .await
+                .map_err(|e| Error::config(e.to_string()))?
+        }
+    };
     let policy = policy::PolicyResolver::new(policy_driver, policy_config.accepted_surfaces);
     info!(driver = %policy.driver_name(), "Using policy driver");
 
