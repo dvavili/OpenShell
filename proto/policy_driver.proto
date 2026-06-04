@@ -1,0 +1,109 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.policy.driver.v1;
+
+// Policy-driver contract the gateway talks to over a unix domain socket.
+//
+// Conventions:
+// - This file owns the driver-native request, response, and projection types.
+// - A driver holds policy in its own internal form and projects it onto the
+//   schema named by `surface_id`; the gateway enforces the projected body and
+//   never inspects or rewrites it.
+service PolicyDriver {
+  // Report driver capabilities and readiness.
+  //
+  // Called once at startup. The gateway reconciles `supported_surfaces`
+  // against the surfaces it accepts and fails closed when there is no overlap.
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+
+  // Bind a runtime context to an opaque handle for one sandbox.
+  rpc AcquireHandle(AcquireHandleRequest) returns (AcquireHandleResponse);
+
+  // Return the projection for a previously acquired handle.
+  //
+  // On success the response carries the projection. When the driver has no
+  // verified policy to return for the handle, it signals a FAILED_PRECONDITION
+  // gRPC status rather than an empty projection. Transport or driver faults
+  // surface as other gRPC status codes. The gateway fails admission closed on
+  // any error status.
+  rpc GetProjection(GetProjectionRequest) returns (GetProjectionResponse);
+
+  // Release the state bound to a handle. Idempotent: releasing an unknown or
+  // already-released handle succeeds.
+  rpc ReleaseHandle(ReleaseHandleRequest) returns (ReleaseHandleResponse);
+}
+
+message GetCapabilitiesRequest {}
+
+message GetCapabilitiesResponse {
+  // Reserved for future optional feature flags.
+  reserved 4 to 15;
+
+  // Policy schemas the driver can project, e.g. "openshell.sandbox.v1".
+  repeated string supported_surfaces = 1;
+  // True when the driver permits the gateway's policy-mutation surface.
+  bool permits_mutation = 2;
+  // Driver implementation version string.
+  string driver_version = 3;
+}
+
+// Gateway-asserted facts about one sandbox, minted at admission. Carries the
+// minimum the driver needs to bind and evaluate policy; extensible later.
+message RuntimeContext {
+  // Stable sandbox ID assigned by the gateway.
+  string sandbox_id = 1;
+  // Authenticated subject the sandbox is created for.
+  string user_subject = 2;
+}
+
+message AcquireHandleRequest {
+  // Runtime context to bind for this sandbox.
+  RuntimeContext runtime_context = 1;
+}
+
+message AcquireHandleResponse {
+  // Opaque per-sandbox reference for fetching the projection and releasing
+  // state.
+  string handle = 1;
+}
+
+message GetProjectionRequest {
+  // Handle returned by AcquireHandle.
+  string handle = 1;
+  // Policy schema the projection should target.
+  string surface_id = 2;
+}
+
+message GetProjectionResponse {
+  // Projection for the handle's sandbox.
+  Projection projection = 1;
+}
+
+message ReleaseHandleRequest {
+  // Handle to release.
+  string handle = 1;
+}
+
+message ReleaseHandleResponse {}
+
+// Policy a driver returns for a sandbox, rendered onto the schema OpenShell
+// enforces.
+message Projection {
+  // Schema `body` conforms to, e.g. "openshell.sandbox.v1".
+  string surface_id = 1;
+  // Hex SHA-256 over `body`.
+  string policy_digest = 2;
+  // Serialized policy the supervisor enforces. The exact bytes `policy_digest`
+  // covers; the gateway relays them unaltered.
+  bytes body = 3;
+  // Signature over the envelope. Present only for signing drivers.
+  optional bytes signature = 4;
+  // Names the trust-store key the signature is verified under. Present only
+  // when `signature` is set.
+  optional string signing_key_id = 5;
+  // Opaque key-value pairs the gateway records verbatim for audit correlation.
+  map<string, string> audit_context = 6;
+}
