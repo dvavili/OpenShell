@@ -170,7 +170,7 @@ impl ServerState {
     ) -> Self {
         // Default driver; `run_server` replaces it with the configured one.
         let policy = policy::PolicyResolver::new(
-            policy::resolve_policy_driver(&[], store.clone()),
+            Arc::new(policy::BuiltinPolicyDriver::new(store.clone())),
             Vec::new(),
         );
         Self {
@@ -249,11 +249,17 @@ pub async fn run_server(
     )
     .await?;
     // Select the policy driver and log the active one.
-    let policy_accepted_surfaces: Vec<String> = Vec::new();
-    let policy = policy::PolicyResolver::new(
-        policy::resolve_policy_driver(&policy_accepted_surfaces, store.clone()),
-        policy_accepted_surfaces,
-    );
+    let policy_config = config_file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.policy.clone())
+        .unwrap_or_default();
+    let policy_driver = policy::resolve_policy_driver(
+        &policy_config.accepted_surfaces,
+        policy_config.driver_socket.as_deref(),
+        store.clone(),
+    )
+    .map_err(|e| Error::config(e.to_string()))?;
+    let policy = policy::PolicyResolver::new(policy_driver, policy_config.accepted_surfaces);
     info!(driver = %policy.driver_name(), "Using policy driver");
 
     let mut state = ServerState::new(

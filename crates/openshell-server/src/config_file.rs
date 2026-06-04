@@ -146,6 +146,8 @@ pub struct GatewayFileSection {
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    #[serde(default)]
+    pub policy: Option<GatewayPolicyConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -154,6 +156,26 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// `[openshell.gateway.policy]` sub-table.
+///
+/// Configures the policy subsystem. The presence of `driver_socket` selects
+/// the driver: unset selects the in-process built-in driver; set connects the
+/// gateway to an operator-run driver at that socket.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayPolicyConfig {
+    /// Policy schemas this gateway enforces.
+    #[serde(default)]
+    pub accepted_surfaces: Vec<String>,
+    /// Path to the trust store of keys signed projections are verified against.
+    #[serde(default)]
+    pub trust_store: Option<PathBuf>,
+    /// Path to the Unix domain socket of an operator-run policy driver. When
+    /// unset, the gateway uses the in-process built-in driver.
+    #[serde(default)]
+    pub driver_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -437,6 +459,52 @@ sandbox_namespace = "agents"
         let tmp = write_tmp(toml);
         let err = load(tmp.path())
             .expect_err("unknown field in nested gateway_jwt table must be rejected");
+        assert!(matches!(err, ConfigFileError::Parse { .. }));
+    }
+
+    #[test]
+    fn absent_policy_table_yields_none() {
+        let toml = r#"
+[openshell.gateway]
+log_level = "info"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("file without policy table parses");
+        assert!(file.openshell.gateway.policy.is_none());
+    }
+
+    #[test]
+    fn parses_full_policy_table() {
+        let toml = r#"
+[openshell.gateway.policy]
+accepted_surfaces = ["openshell.sandbox.v1"]
+trust_store = "/etc/openshell/policy.trust"
+driver_socket = "/run/openshell/policy.sock"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("policy table parses");
+        let policy = file.openshell.gateway.policy.expect("policy config");
+        assert_eq!(policy.accepted_surfaces, vec!["openshell.sandbox.v1"]);
+        assert_eq!(
+            policy.trust_store.as_deref(),
+            Some(Path::new("/etc/openshell/policy.trust"))
+        );
+        assert_eq!(
+            policy.driver_socket.as_deref(),
+            Some(Path::new("/run/openshell/policy.sock"))
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_nested_policy_table() {
+        let toml = r#"
+[openshell.gateway.policy]
+accepted_surfaces = ["openshell.sandbox.v1"]
+nonsense = true
+"#;
+        let tmp = write_tmp(toml);
+        let err =
+            load(tmp.path()).expect_err("unknown field in nested policy table must be rejected");
         assert!(matches!(err, ConfigFileError::Parse { .. }));
     }
 

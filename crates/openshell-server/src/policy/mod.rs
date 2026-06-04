@@ -10,6 +10,7 @@
 use crate::persistence::Store;
 use openshell_core::proto::{PolicySource, Sandbox, SandboxPolicy};
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Errors returned by a policy driver.
@@ -18,6 +19,10 @@ pub enum PolicyError {
     /// The driver could not produce a policy for the request.
     #[error("policy driver: {0}")]
     Message(String),
+
+    /// The configured driver selection is not yet supported.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Inputs a driver needs to resolve the policy for one sandbox.
@@ -153,13 +158,23 @@ impl PolicyResolver {
     }
 }
 
-/// Select the policy driver for the given accepted surfaces.
-#[must_use]
+/// Select the policy driver for the configured surfaces and driver socket.
+///
+/// `driver_socket` is the driver selector: `None` selects the in-process
+/// built-in driver; `Some(_)` selects a third-party driver at that socket and
+/// fails closed until that path is implemented. A configured socket never
+/// silently falls back to the built-in driver.
 pub fn resolve_policy_driver(
     _accepted_surfaces: &[String],
+    driver_socket: Option<&Path>,
     store: Arc<Store>,
-) -> Arc<dyn PolicyDriver> {
-    Arc::new(BuiltinPolicyDriver::new(store))
+) -> Result<Arc<dyn PolicyDriver>, PolicyError> {
+    match driver_socket {
+        None => Ok(Arc::new(BuiltinPolicyDriver::new(store))),
+        Some(_) => Err(PolicyError::Unsupported(
+            "third-party policy driver not yet implemented (RFC 0005 step 2.3)".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -187,19 +202,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn factory_returns_builtin_driver() {
+    async fn factory_returns_builtin_driver_without_socket() {
         let store = Arc::new(test_store().await);
-        let driver = resolve_policy_driver(&[], store);
+        let driver = resolve_policy_driver(&[], None, store).expect("builtin driver");
         assert_eq!(driver.name(), BuiltinPolicyDriver::NAME);
         assert_eq!(driver.name(), "builtin");
+    }
+
+    #[tokio::test]
+    async fn factory_rejects_configured_driver_socket() {
+        let store = Arc::new(test_store().await);
+        let socket = Path::new("/run/openshell/policy.sock");
+        match resolve_policy_driver(&[], Some(socket), store) {
+            Err(PolicyError::Unsupported(_)) => {}
+            Ok(_) => panic!("configured socket must fail closed, not run builtin"),
+            Err(other) => panic!("unexpected error: {other}"),
+        }
     }
 
     #[tokio::test]
     async fn coordinator_exposes_accepted_surfaces_and_driver_name() {
         let store = Arc::new(test_store().await);
         let surfaces = vec!["openshell.sandbox.v1".to_string()];
-        let resolver =
-            PolicyResolver::new(resolve_policy_driver(&surfaces, store), surfaces.clone());
+        let resolver = PolicyResolver::new(
+            resolve_policy_driver(&surfaces, None, store).expect("builtin driver"),
+            surfaces.clone(),
+        );
         assert_eq!(resolver.accepted_surfaces(), surfaces.as_slice());
         assert_eq!(resolver.driver_name(), "builtin");
     }
@@ -207,7 +235,10 @@ mod tests {
     #[tokio::test]
     async fn coordinator_default_has_no_accepted_surfaces() {
         let store = Arc::new(test_store().await);
-        let resolver = PolicyResolver::new(resolve_policy_driver(&[], store), Vec::new());
+        let resolver = PolicyResolver::new(
+            resolve_policy_driver(&[], None, store).expect("builtin driver"),
+            Vec::new(),
+        );
         assert!(resolver.accepted_surfaces().is_empty());
     }
 
