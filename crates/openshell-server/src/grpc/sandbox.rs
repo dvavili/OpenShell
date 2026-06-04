@@ -118,6 +118,7 @@ async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    let user_subject = principal_user_subject(&request);
     let request = request.into_inner();
     let spec = request
         .spec
@@ -211,6 +212,22 @@ async fn handle_create_sandbox_inner(
         None => None,
     };
 
+    // Bind the policy driver's handle before admitting the sandbox. A driver
+    // that keeps no per-sandbox state returns no handle. A driver error fails
+    // admission closed.
+    state
+        .policy
+        .driver()
+        .acquire_handle(crate::policy::RuntimeContext {
+            sandbox_id: id.clone(),
+            user_subject: user_subject.clone(),
+        })
+        .await
+        .map_err(|e| {
+            warn!(sandbox_id = %id, error = %e, "policy driver refused to acquire a handle");
+            Status::failed_precondition(format!("policy driver could not admit sandbox: {e}"))
+        })?;
+
     let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
     info!(
@@ -221,6 +238,16 @@ async fn handle_create_sandbox_inner(
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
+}
+
+/// Authenticated subject the request is admitted under, or empty when the
+/// caller carries no user identity.
+fn principal_user_subject(request: &Request<CreateSandboxRequest>) -> String {
+    use crate::auth::principal::Principal;
+    match request.extensions().get::<Principal>() {
+        Some(Principal::User(user)) => user.identity.subject.clone(),
+        _ => String::new(),
+    }
 }
 
 pub(super) async fn handle_get_sandbox(
@@ -503,6 +530,11 @@ async fn handle_delete_sandbox_inner(
     let deleted = state.compute.delete_sandbox(&name).await?;
     if deleted && let Some(sandbox_id) = sandbox_id {
         state.telemetry.end_sandbox_session(&sandbox_id);
+        // Release any policy driver handle bound to the sandbox. Idempotent;
+        // a driver that keeps no state does nothing.
+        if let Err(e) = state.policy.driver().release_handle(&sandbox_id).await {
+            warn!(sandbox_id = %sandbox_id, error = %e, "failed to release policy driver handle");
+        }
     }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse { deleted }))

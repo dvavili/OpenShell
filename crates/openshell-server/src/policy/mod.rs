@@ -10,15 +10,21 @@
 use crate::persistence::Store;
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
+use openshell_core::ObjectId;
 use openshell_core::proto::policy_driver::v1::{
-    GetCapabilitiesRequest, policy_driver_client::PolicyDriverClient,
+    AcquireHandleRequest, GetCapabilitiesRequest, GetProjectionRequest, ReleaseHandleRequest,
+    RuntimeContext as ProtoRuntimeContext, policy_driver_client::PolicyDriverClient,
 };
 use openshell_core::proto::{PolicySource, Sandbox, SandboxPolicy};
+use prost::Message;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(unix)]
 use tokio::net::UnixStream;
+use tokio::sync::Mutex;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
@@ -53,6 +59,36 @@ pub enum PolicyError {
         /// Surfaces the gateway is configured to accept.
         accepted: Vec<String>,
     },
+
+    /// A driver RPC returned an error status at runtime.
+    #[error("policy driver {rpc}: {status}")]
+    DriverRpc {
+        /// The RPC that failed, e.g. `GetProjection`.
+        rpc: &'static str,
+        /// The gRPC status the driver returned.
+        status: Box<tonic::Status>,
+    },
+
+    /// The driver returned a projection that failed an integrity check.
+    #[error("policy driver projection: {0}")]
+    Projection(String),
+
+    /// Persisting or reading driver handle state failed.
+    #[error("policy handle store: {0}")]
+    HandleStore(String),
+}
+
+impl PolicyError {
+    /// Whether the error is a no-verified-policy precondition from the driver,
+    /// which callers map to `FAILED_PRECONDITION` at the edge.
+    #[must_use]
+    pub fn is_no_verified_policy(&self) -> bool {
+        matches!(
+            self,
+            Self::DriverRpc { status, .. }
+                if status.code() == tonic::Code::FailedPrecondition
+        )
+    }
 }
 
 /// Inputs a driver needs to resolve the policy for one sandbox.
@@ -70,6 +106,24 @@ impl<'a> PolicyRequest<'a> {
     }
 }
 
+/// Facts about one sandbox the gateway asserts to the driver at admission.
+#[derive(Debug, Clone)]
+pub struct RuntimeContext {
+    /// Stable sandbox id assigned by the gateway.
+    pub sandbox_id: String,
+    /// Authenticated subject the sandbox is created for.
+    pub user_subject: String,
+}
+
+impl From<RuntimeContext> for ProtoRuntimeContext {
+    fn from(ctx: RuntimeContext) -> Self {
+        Self {
+            sandbox_id: ctx.sandbox_id,
+            user_subject: ctx.user_subject,
+        }
+    }
+}
+
 /// The resolved policy for a sandbox plus the metadata callers report
 /// alongside it.
 #[derive(Debug, Clone, Default)]
@@ -84,6 +138,8 @@ pub struct EffectivePolicy {
     pub policy_source: PolicySource,
     /// Revision number of the active global policy, if any.
     pub global_policy_version: u32,
+    /// Opaque key-value pairs recorded verbatim for audit correlation.
+    pub audit_context: BTreeMap<String, String>,
 }
 
 /// A source of sandbox policy.
@@ -98,6 +154,21 @@ pub trait PolicyDriver: Send + Sync {
         &self,
         request: PolicyRequest<'_>,
     ) -> Result<EffectivePolicy, PolicyError>;
+
+    /// Bind a runtime context at sandbox admission, returning the driver's
+    /// handle when it keeps per-sandbox state. The default keeps no state.
+    async fn acquire_handle(
+        &self,
+        _context: RuntimeContext,
+    ) -> Result<Option<String>, PolicyError> {
+        Ok(None)
+    }
+
+    /// Release any state bound to a sandbox at deletion. Idempotent; the
+    /// default keeps no state.
+    async fn release_handle(&self, _sandbox_id: &str) -> Result<(), PolicyError> {
+        Ok(())
+    }
 
     /// Whether the driver permits the gateway's policy-mutation surface.
     fn permits_mutation(&self) -> bool {
@@ -151,11 +222,11 @@ impl PolicyDriver for BuiltinPolicyDriver {
 /// Driver that sources policy from an operator-run process over a unix
 /// domain socket.
 pub struct ExternalPolicyDriver {
-    #[allow(dead_code)]
-    client: PolicyDriverClient<Channel>,
+    client: Mutex<PolicyDriverClient<Channel>>,
     supported_surfaces: Vec<String>,
     permits_mutation: bool,
     driver_version: String,
+    store: Arc<Store>,
 }
 
 impl fmt::Debug for ExternalPolicyDriver {
@@ -171,6 +242,12 @@ impl fmt::Debug for ExternalPolicyDriver {
 impl ExternalPolicyDriver {
     /// Driver name.
     pub const NAME: &'static str = "external";
+
+    /// The surface the gateway requests projections on. The first reconciled
+    /// surface; the gateway accepts exactly one in v0.
+    fn projection_surface(&self) -> &str {
+        self.supported_surfaces.first().map_or("", String::as_str)
+    }
 }
 
 #[async_trait::async_trait]
@@ -181,16 +258,132 @@ impl PolicyDriver for ExternalPolicyDriver {
 
     async fn effective_policy(
         &self,
-        _request: PolicyRequest<'_>,
+        request: PolicyRequest<'_>,
     ) -> Result<EffectivePolicy, PolicyError> {
-        Err(PolicyError::Unsupported(
-            "external policy driver projection not yet implemented (RFC 0005 step 2.4)".to_string(),
-        ))
+        let sandbox_id = request.sandbox.object_id();
+        let handle = self
+            .store
+            .get_policy_handle(sandbox_id)
+            .await
+            .map_err(|e| PolicyError::HandleStore(e.to_string()))?
+            .ok_or_else(|| {
+                PolicyError::Projection(format!("no handle bound for sandbox '{sandbox_id}'"))
+            })?;
+
+        let surface_id = self.projection_surface().to_string();
+        let response = self
+            .client
+            .lock()
+            .await
+            .get_projection(tonic::Request::new(GetProjectionRequest {
+                handle,
+                surface_id,
+            }))
+            .await
+            .map_err(|status| PolicyError::DriverRpc {
+                rpc: "GetProjection",
+                status: Box::new(status),
+            })?
+            .into_inner();
+
+        let projection = response.projection.ok_or_else(|| {
+            PolicyError::Projection("driver returned an empty projection".to_string())
+        })?;
+
+        let computed_digest = sha256_hex(&projection.body);
+        if computed_digest != projection.policy_digest {
+            return Err(PolicyError::Projection(format!(
+                "projection digest mismatch: driver reported '{}', body hashes to '{computed_digest}'",
+                projection.policy_digest
+            )));
+        }
+
+        if projection.signature.is_some() {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                "policy projection carries a signature but signature verification is not enabled"
+            );
+        }
+
+        let policy = SandboxPolicy::decode(projection.body.as_slice())
+            .map_err(|e| PolicyError::Projection(format!("decode projection body failed: {e}")))?;
+
+        Ok(EffectivePolicy {
+            policy: Some(policy),
+            version: 0,
+            policy_hash: projection.policy_digest,
+            policy_source: PolicySource::Sandbox,
+            global_policy_version: 0,
+            audit_context: projection.audit_context.into_iter().collect(),
+        })
+    }
+
+    async fn acquire_handle(&self, context: RuntimeContext) -> Result<Option<String>, PolicyError> {
+        let sandbox_id = context.sandbox_id.clone();
+        let response = self
+            .client
+            .lock()
+            .await
+            .acquire_handle(tonic::Request::new(AcquireHandleRequest {
+                runtime_context: Some(context.into()),
+            }))
+            .await
+            .map_err(|status| PolicyError::DriverRpc {
+                rpc: "AcquireHandle",
+                status: Box::new(status),
+            })?
+            .into_inner();
+
+        self.store
+            .put_policy_handle(&sandbox_id, &response.handle)
+            .await
+            .map_err(|e| PolicyError::HandleStore(e.to_string()))?;
+
+        Ok(Some(response.handle))
+    }
+
+    async fn release_handle(&self, sandbox_id: &str) -> Result<(), PolicyError> {
+        let handle = self
+            .store
+            .get_policy_handle(sandbox_id)
+            .await
+            .map_err(|e| PolicyError::HandleStore(e.to_string()))?;
+
+        if let Some(handle) = handle {
+            self.client
+                .lock()
+                .await
+                .release_handle(tonic::Request::new(ReleaseHandleRequest { handle }))
+                .await
+                .map_err(|status| PolicyError::DriverRpc {
+                    rpc: "ReleaseHandle",
+                    status: Box::new(status),
+                })?;
+            self.store
+                .delete_policy_handle(sandbox_id)
+                .await
+                .map_err(|e| PolicyError::HandleStore(e.to_string()))?;
+        }
+
+        Ok(())
     }
 
     fn permits_mutation(&self) -> bool {
         self.permits_mutation
     }
+}
+
+/// Hex-encoded SHA-256 over the given bytes.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Holds the active driver and the policy surfaces the gateway enforces.
@@ -275,6 +468,7 @@ pub fn resolve_policy_driver(
 pub async fn connect_external_policy_driver(
     driver_socket: &Path,
     accepted_surfaces: &[String],
+    store: Arc<Store>,
 ) -> Result<Arc<dyn PolicyDriver>, PolicyError> {
     let socket = driver_socket.to_path_buf();
     let display = socket.display().to_string();
@@ -315,10 +509,11 @@ pub async fn connect_external_policy_driver(
     }
 
     Ok(Arc::new(ExternalPolicyDriver {
-        client,
+        client: Mutex::new(client),
         supported_surfaces: supported,
         permits_mutation: capabilities.permits_mutation,
         driver_version: capabilities.driver_version,
+        store,
     }))
 }
 
@@ -502,27 +697,68 @@ mod tests {
     #[cfg(unix)]
     mod external {
         use super::*;
+        use openshell_core::proto::SandboxPolicy;
         use openshell_core::proto::policy_driver::v1::policy_driver_server::{
             PolicyDriver as PolicyDriverService, PolicyDriverServer,
         };
         use openshell_core::proto::policy_driver::v1::{
             AcquireHandleRequest, AcquireHandleResponse, GetCapabilitiesResponse,
-            GetProjectionRequest, GetProjectionResponse, ReleaseHandleRequest,
+            GetProjectionRequest, GetProjectionResponse, Projection, ReleaseHandleRequest,
             ReleaseHandleResponse,
         };
+        use std::collections::HashMap;
         use std::path::PathBuf;
         use std::time::{SystemTime, UNIX_EPOCH};
         use tokio::net::UnixListener;
         use tonic::transport::Server;
         use tonic::{Request, Response, Status};
 
-        struct CapabilitiesDouble {
+        const TEST_SURFACE: &str = "openshell.sandbox.v1";
+
+        /// Configurable in-process driver covering the four RPCs.
+        struct DriverDouble {
             supported_surfaces: Vec<String>,
             permits_mutation: bool,
+            /// Handle the driver hands out on acquire.
+            handle: String,
+            /// Policy body the driver projects, or `None` to signal
+            /// no-verified-policy.
+            projection_body: Option<Vec<u8>>,
+            /// Override the digest the driver reports (for the mismatch case).
+            digest_override: Option<String>,
+            /// When set, acquire fails with this status (driver-down at acquire).
+            acquire_fails: bool,
+        }
+
+        impl DriverDouble {
+            fn projecting(body: Vec<u8>) -> Self {
+                Self {
+                    supported_surfaces: vec![TEST_SURFACE.to_string()],
+                    permits_mutation: true,
+                    handle: "handle-1".to_string(),
+                    projection_body: Some(body),
+                    digest_override: None,
+                    acquire_fails: false,
+                }
+            }
+
+            fn no_verified_policy() -> Self {
+                Self {
+                    projection_body: None,
+                    ..Self::projecting(Vec::new())
+                }
+            }
+
+            fn failing_acquire() -> Self {
+                Self {
+                    acquire_fails: true,
+                    ..Self::projecting(Vec::new())
+                }
+            }
         }
 
         #[tonic::async_trait]
-        impl PolicyDriverService for CapabilitiesDouble {
+        impl PolicyDriverService for DriverDouble {
             async fn get_capabilities(
                 &self,
                 _request: Request<GetCapabilitiesRequest>,
@@ -538,21 +774,44 @@ mod tests {
                 &self,
                 _request: Request<AcquireHandleRequest>,
             ) -> Result<Response<AcquireHandleResponse>, Status> {
-                Err(Status::unimplemented("acquire_handle"))
+                if self.acquire_fails {
+                    return Err(Status::unavailable("driver unavailable"));
+                }
+                Ok(Response::new(AcquireHandleResponse {
+                    handle: self.handle.clone(),
+                }))
             }
 
             async fn get_projection(
                 &self,
                 _request: Request<GetProjectionRequest>,
             ) -> Result<Response<GetProjectionResponse>, Status> {
-                Err(Status::unimplemented("get_projection"))
+                let Some(body) = self.projection_body.clone() else {
+                    return Err(Status::failed_precondition("no verified policy"));
+                };
+                let digest = self
+                    .digest_override
+                    .clone()
+                    .unwrap_or_else(|| sha256_hex(&body));
+                let mut audit_context = HashMap::new();
+                audit_context.insert("driver".to_string(), "double".to_string());
+                Ok(Response::new(GetProjectionResponse {
+                    projection: Some(Projection {
+                        surface_id: TEST_SURFACE.to_string(),
+                        policy_digest: digest,
+                        body,
+                        signature: None,
+                        signing_key_id: None,
+                        audit_context,
+                    }),
+                }))
             }
 
             async fn release_handle(
                 &self,
                 _request: Request<ReleaseHandleRequest>,
             ) -> Result<Response<ReleaseHandleResponse>, Status> {
-                Err(Status::unimplemented("release_handle"))
+                Ok(Response::new(ReleaseHandleResponse {}))
             }
         }
 
@@ -572,12 +831,17 @@ mod tests {
             supported_surfaces: Vec<String>,
             permits_mutation: bool,
         ) -> tokio::task::JoinHandle<()> {
-            let _ = std::fs::remove_file(socket);
-            let listener = UnixListener::bind(socket).expect("test socket should bind");
-            let double = CapabilitiesDouble {
+            let double = DriverDouble {
                 supported_surfaces,
                 permits_mutation,
+                ..DriverDouble::projecting(Vec::new())
             };
+            spawn_driver_double(socket, double)
+        }
+
+        fn spawn_driver_double(socket: &Path, double: DriverDouble) -> tokio::task::JoinHandle<()> {
+            let _ = std::fs::remove_file(socket);
+            let listener = UnixListener::bind(socket).expect("test socket should bind");
             tokio::spawn(async move {
                 let incoming = futures::stream::unfold(listener, |listener| async move {
                     let item = listener.accept().await.map(|(stream, _)| stream);
@@ -588,6 +852,13 @@ mod tests {
                     .serve_with_incoming(incoming)
                     .await;
             })
+        }
+
+        fn canned_policy() -> SandboxPolicy {
+            SandboxPolicy {
+                version: 9,
+                ..Default::default()
+            }
         }
 
         #[tokio::test]
@@ -603,7 +874,8 @@ mod tests {
             );
 
             let accepted = vec!["openshell.sandbox.v1".to_string()];
-            let driver = connect_external_policy_driver(&socket, &accepted)
+            let store = Arc::new(test_store().await);
+            let driver = connect_external_policy_driver(&socket, &accepted, store)
                 .await
                 .expect("driver connects");
             assert_eq!(driver.name(), "external");
@@ -623,7 +895,8 @@ mod tests {
             let server = spawn_driver(&socket, vec!["vendor.other.v1".to_string()], true);
 
             let accepted = vec!["openshell.sandbox.v1".to_string()];
-            match connect_external_policy_driver(&socket, &accepted).await {
+            let store = Arc::new(test_store().await);
+            match connect_external_policy_driver(&socket, &accepted, store).await {
                 Err(PolicyError::NoSurfaceOverlap { .. }) => {}
                 Ok(_) => panic!("expected no-overlap error, driver connected"),
                 Err(other) => panic!("expected no-overlap error, got {other:?}"),
@@ -638,7 +911,8 @@ mod tests {
             let socket = unique_socket_path("empty-accepted");
             let server = spawn_driver(&socket, vec!["openshell.sandbox.v1".to_string()], true);
 
-            match connect_external_policy_driver(&socket, &[]).await {
+            let store = Arc::new(test_store().await);
+            match connect_external_policy_driver(&socket, &[], store).await {
                 Err(PolicyError::NoSurfaceOverlap { .. }) => {}
                 Ok(_) => panic!("expected no-overlap error, driver connected"),
                 Err(other) => panic!("expected no-overlap error, got {other:?}"),
@@ -654,7 +928,8 @@ mod tests {
             let _ = std::fs::remove_file(&socket);
 
             let accepted = vec!["openshell.sandbox.v1".to_string()];
-            match connect_external_policy_driver(&socket, &accepted).await {
+            let store = Arc::new(test_store().await);
+            match connect_external_policy_driver(&socket, &accepted, store).await {
                 Err(PolicyError::Connect { .. }) => {}
                 Ok(_) => panic!("expected connect error, driver connected"),
                 Err(other) => panic!("expected connect error, got {other:?}"),
@@ -667,7 +942,8 @@ mod tests {
             let server = spawn_driver(&socket, vec!["openshell.sandbox.v1".to_string()], false);
 
             let accepted = vec!["openshell.sandbox.v1".to_string()];
-            let driver = connect_external_policy_driver(&socket, &accepted)
+            let store = Arc::new(test_store().await);
+            let driver = connect_external_policy_driver(&socket, &accepted, store)
                 .await
                 .expect("driver connects");
             assert!(!driver.permits_mutation());
@@ -677,6 +953,258 @@ mod tests {
 
             server.abort();
             let _ = std::fs::remove_file(&socket);
+        }
+
+        #[tokio::test]
+        async fn acquires_persists_and_projects() {
+            let store = Arc::new(test_store().await);
+            let policy = canned_policy();
+            let body = policy.encode_to_vec();
+            let digest = sha256_hex(&body);
+
+            let socket = unique_socket_path("acquire-project");
+            let server = spawn_driver_double(&socket, DriverDouble::projecting(body.clone()));
+
+            let accepted = vec![TEST_SURFACE.to_string()];
+            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+                .await
+                .expect("driver connects");
+
+            let context = RuntimeContext {
+                sandbox_id: "sb-1".to_string(),
+                user_subject: "alice".to_string(),
+            };
+            let handle = driver
+                .acquire_handle(context)
+                .await
+                .expect("acquire succeeds");
+            assert_eq!(handle.as_deref(), Some("handle-1"));
+            assert_eq!(
+                store.get_policy_handle("sb-1").await.expect("read handle"),
+                Some("handle-1".to_string())
+            );
+
+            let sandbox = sandbox_with_spec("sb-1", None);
+            let effective = driver
+                .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+                .await
+                .expect("projection resolves");
+            assert_eq!(effective.policy, Some(policy));
+            assert_eq!(effective.policy_hash, digest);
+            assert_eq!(
+                effective.audit_context.get("driver").map(String::as_str),
+                Some("double")
+            );
+
+            server.abort();
+            let _ = std::fs::remove_file(&socket);
+        }
+
+        #[tokio::test]
+        async fn projection_survives_restart_via_persisted_handle() {
+            let store = Arc::new(test_store().await);
+            let policy = canned_policy();
+            let body = policy.encode_to_vec();
+
+            let socket = unique_socket_path("restart");
+            let server = spawn_driver_double(&socket, DriverDouble::projecting(body.clone()));
+            let accepted = vec![TEST_SURFACE.to_string()];
+
+            {
+                let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+                    .await
+                    .expect("driver connects");
+                driver
+                    .acquire_handle(RuntimeContext {
+                        sandbox_id: "sb-restart".to_string(),
+                        user_subject: "alice".to_string(),
+                    })
+                    .await
+                    .expect("acquire succeeds");
+            }
+
+            // A fresh driver instance (gateway restart) never re-acquires; it
+            // resolves the projection from the persisted handle.
+            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+                .await
+                .expect("driver reconnects");
+            let sandbox = sandbox_with_spec("sb-restart", None);
+            let effective = driver
+                .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+                .await
+                .expect("projection resolves after restart");
+            assert_eq!(effective.policy, Some(policy));
+
+            server.abort();
+            let _ = std::fs::remove_file(&socket);
+        }
+
+        #[tokio::test]
+        async fn releases_and_deletes_handle_on_delete() {
+            let store = Arc::new(test_store().await);
+            let body = canned_policy().encode_to_vec();
+
+            let socket = unique_socket_path("release");
+            let server = spawn_driver_double(&socket, DriverDouble::projecting(body));
+            let accepted = vec![TEST_SURFACE.to_string()];
+
+            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+                .await
+                .expect("driver connects");
+            driver
+                .acquire_handle(RuntimeContext {
+                    sandbox_id: "sb-del".to_string(),
+                    user_subject: "alice".to_string(),
+                })
+                .await
+                .expect("acquire succeeds");
+
+            driver
+                .release_handle("sb-del")
+                .await
+                .expect("release succeeds");
+            assert_eq!(
+                store
+                    .get_policy_handle("sb-del")
+                    .await
+                    .expect("read handle"),
+                None
+            );
+
+            // Releasing an unknown sandbox is idempotent.
+            driver
+                .release_handle("sb-unknown")
+                .await
+                .expect("idempotent release");
+
+            server.abort();
+            let _ = std::fs::remove_file(&socket);
+        }
+
+        #[tokio::test]
+        async fn no_verified_policy_fails_closed() {
+            let store = Arc::new(test_store().await);
+            let socket = unique_socket_path("no-policy");
+            let server = spawn_driver_double(&socket, DriverDouble::no_verified_policy());
+            let accepted = vec![TEST_SURFACE.to_string()];
+
+            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+                .await
+                .expect("driver connects");
+            driver
+                .acquire_handle(RuntimeContext {
+                    sandbox_id: "sb-np".to_string(),
+                    user_subject: "alice".to_string(),
+                })
+                .await
+                .expect("acquire succeeds");
+
+            let sandbox = sandbox_with_spec("sb-np", None);
+            match driver
+                .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+                .await
+            {
+                Err(e) => assert!(e.is_no_verified_policy(), "expected precondition: {e:?}"),
+                Ok(_) => panic!("expected fail-closed on no verified policy"),
+            }
+
+            server.abort();
+            let _ = std::fs::remove_file(&socket);
+        }
+
+        #[tokio::test]
+        async fn digest_mismatch_fails_closed() {
+            let store = Arc::new(test_store().await);
+            let body = canned_policy().encode_to_vec();
+            let mut double = DriverDouble::projecting(body);
+            double.digest_override = Some("deadbeef".to_string());
+
+            let socket = unique_socket_path("digest-mismatch");
+            let server = spawn_driver_double(&socket, double);
+            let accepted = vec![TEST_SURFACE.to_string()];
+
+            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+                .await
+                .expect("driver connects");
+            driver
+                .acquire_handle(RuntimeContext {
+                    sandbox_id: "sb-dm".to_string(),
+                    user_subject: "alice".to_string(),
+                })
+                .await
+                .expect("acquire succeeds");
+
+            let sandbox = sandbox_with_spec("sb-dm", None);
+            match driver
+                .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+                .await
+            {
+                Err(PolicyError::Projection(_)) => {}
+                Ok(_) => panic!("expected fail-closed on digest mismatch"),
+                Err(other) => panic!("expected projection error, got {other:?}"),
+            }
+
+            server.abort();
+            let _ = std::fs::remove_file(&socket);
+        }
+
+        #[tokio::test]
+        async fn acquire_failure_fails_closed_and_binds_no_handle() {
+            let store = Arc::new(test_store().await);
+            let socket = unique_socket_path("acquire-down");
+            let server = spawn_driver_double(&socket, DriverDouble::failing_acquire());
+            let accepted = vec![TEST_SURFACE.to_string()];
+
+            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+                .await
+                .expect("driver connects");
+
+            match driver
+                .acquire_handle(RuntimeContext {
+                    sandbox_id: "sb-down".to_string(),
+                    user_subject: "alice".to_string(),
+                })
+                .await
+            {
+                Err(PolicyError::DriverRpc { rpc, .. }) => assert_eq!(rpc, "AcquireHandle"),
+                Ok(_) => panic!("expected acquire to fail when the driver refuses"),
+                Err(other) => panic!("expected driver rpc error, got {other:?}"),
+            }
+            assert_eq!(
+                store
+                    .get_policy_handle("sb-down")
+                    .await
+                    .expect("read handle"),
+                None
+            );
+
+            server.abort();
+            let _ = std::fs::remove_file(&socket);
+        }
+
+        #[tokio::test]
+        async fn builtin_lifecycle_is_noop_and_persists_nothing() {
+            let store = Arc::new(test_store().await);
+            let driver = BuiltinPolicyDriver::new(store.clone());
+            let handle = driver
+                .acquire_handle(RuntimeContext {
+                    sandbox_id: "sb-builtin".to_string(),
+                    user_subject: "alice".to_string(),
+                })
+                .await
+                .expect("builtin acquire");
+            assert_eq!(handle, None);
+            assert_eq!(
+                store
+                    .get_policy_handle("sb-builtin")
+                    .await
+                    .expect("read handle"),
+                None
+            );
+            driver
+                .release_handle("sb-builtin")
+                .await
+                .expect("builtin release");
         }
     }
 }

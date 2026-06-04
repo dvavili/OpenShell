@@ -23,6 +23,8 @@ pub use sqlite::SqliteStore;
 pub const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
 /// Object type string for draft policy chunk records.
 pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
+/// Object type string for policy-driver handle records, keyed by sandbox id.
+pub const POLICY_HANDLE_OBJECT_TYPE: &str = "policy_handle";
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
@@ -366,6 +368,41 @@ impl Store {
                     .await
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Policy-driver handle helpers
+    // -----------------------------------------------------------------------
+
+    /// Persist the policy-driver handle bound to a sandbox.
+    pub async fn put_policy_handle(&self, sandbox_id: &str, handle: &str) -> PersistenceResult<()> {
+        self.put_if(
+            POLICY_HANDLE_OBJECT_TYPE,
+            sandbox_id,
+            sandbox_id,
+            handle.as_bytes(),
+            None,
+            WriteCondition::Unconditional,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Fetch the policy-driver handle bound to a sandbox, if any.
+    pub async fn get_policy_handle(&self, sandbox_id: &str) -> PersistenceResult<Option<String>> {
+        let record = self.get(POLICY_HANDLE_OBJECT_TYPE, sandbox_id).await?;
+        match record {
+            Some(record) => String::from_utf8(record.payload)
+                .map(Some)
+                .map_err(|e| PersistenceError::Decode(format!("policy handle is not utf-8: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete the policy-driver handle bound to a sandbox. Returns whether a
+    /// record was removed.
+    pub async fn delete_policy_handle(&self, sandbox_id: &str) -> PersistenceResult<bool> {
+        self.delete(POLICY_HANDLE_OBJECT_TYPE, sandbox_id).await
     }
 
     // -----------------------------------------------------------------------

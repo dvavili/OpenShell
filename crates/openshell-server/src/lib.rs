@@ -258,11 +258,13 @@ pub async fn run_server(
             policy::resolve_policy_driver(&policy_config.accepted_surfaces, None, store.clone())
                 .map_err(|e| Error::config(e.to_string()))?
         }
-        Some(socket) => {
-            policy::connect_external_policy_driver(socket, &policy_config.accepted_surfaces)
-                .await
-                .map_err(|e| Error::config(e.to_string()))?
-        }
+        Some(socket) => policy::connect_external_policy_driver(
+            socket,
+            &policy_config.accepted_surfaces,
+            store.clone(),
+        )
+        .await
+        .map_err(|e| Error::config(e.to_string()))?,
     };
     let policy = policy::PolicyResolver::new(policy_driver, policy_config.accepted_surfaces);
     info!(driver = %policy.driver_name(), "Using policy driver");

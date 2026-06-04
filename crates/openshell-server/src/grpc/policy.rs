@@ -1225,6 +1225,7 @@ pub async fn compose_effective_policy_for_sandbox(
         policy_hash,
         policy_source,
         global_policy_version,
+        ..Default::default()
     })
 }
 
@@ -1254,12 +1255,20 @@ pub(super) async fn handle_get_sandbox_config(
         policy_hash,
         policy_source,
         global_policy_version,
+        // Carried for audit emission (RFC 0005 step 2.7); not emitted yet.
+        audit_context: _audit_context,
     } = state
         .policy
         .driver()
         .effective_policy(PolicyRequest::for_sandbox(&sandbox))
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        .map_err(|e| {
+            if e.is_no_verified_policy() {
+                Status::failed_precondition(e.to_string())
+            } else {
+                Status::internal(e.to_string())
+            }
+        })?;
 
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let sandbox_settings =
