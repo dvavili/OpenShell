@@ -169,8 +169,10 @@ impl ServerState {
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
         // Default driver; `run_server` replaces it with the configured one.
-        let policy =
-            policy::PolicyResolver::new(policy::resolve_policy_driver(&[]), Vec::new());
+        let policy = policy::PolicyResolver::new(
+            policy::resolve_policy_driver(&[], store.clone()),
+            Vec::new(),
+        );
         Self {
             config,
             store,
@@ -249,7 +251,7 @@ pub async fn run_server(
     // Select the policy driver and log the active one.
     let policy_accepted_surfaces: Vec<String> = Vec::new();
     let policy = policy::PolicyResolver::new(
-        policy::resolve_policy_driver(&policy_accepted_surfaces),
+        policy::resolve_policy_driver(&policy_accepted_surfaces, store.clone()),
         policy_accepted_surfaces,
     );
     info!(driver = %policy.driver_name(), "Using policy driver");

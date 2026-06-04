@@ -7,7 +7,8 @@
 //! surfaces the gateway enforces. [`BuiltinPolicyDriver`] is the default
 //! driver and serves policy from the gateway's store.
 
-use openshell_core::proto::{Sandbox, SandboxPolicy};
+use crate::persistence::Store;
+use openshell_core::proto::{PolicySource, Sandbox, SandboxPolicy};
 use std::fmt;
 use std::sync::Arc;
 
@@ -34,32 +35,57 @@ impl<'a> PolicyRequest<'a> {
     }
 }
 
+/// The resolved policy for a sandbox plus the metadata callers report
+/// alongside it.
+#[derive(Debug, Clone, Default)]
+pub struct EffectivePolicy {
+    /// The composed policy, or `None` when none is configured.
+    pub policy: Option<SandboxPolicy>,
+    /// Policy revision number.
+    pub version: u32,
+    /// Deterministic hash of the composed policy.
+    pub policy_hash: String,
+    /// Where the policy originated.
+    pub policy_source: PolicySource,
+    /// Revision number of the active global policy, if any.
+    pub global_policy_version: u32,
+}
+
 /// A source of sandbox policy.
 #[async_trait::async_trait]
 pub trait PolicyDriver: Send + Sync {
     /// Driver name, used in logs and audit.
     fn name(&self) -> &str;
 
-    /// Resolve the policy for the requested sandbox, or `None` when none is
-    /// configured.
+    /// Resolve the effective policy and its metadata for the requested
+    /// sandbox.
     async fn effective_policy(
         &self,
         request: PolicyRequest<'_>,
-    ) -> Result<Option<SandboxPolicy>, PolicyError>;
+    ) -> Result<EffectivePolicy, PolicyError>;
 }
 
 /// Default driver. Serves policy from the gateway's store.
-#[derive(Debug, Default, Clone)]
-pub struct BuiltinPolicyDriver;
+#[derive(Clone)]
+pub struct BuiltinPolicyDriver {
+    store: Arc<Store>,
+}
+
+impl fmt::Debug for BuiltinPolicyDriver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BuiltinPolicyDriver")
+            .finish_non_exhaustive()
+    }
+}
 
 impl BuiltinPolicyDriver {
     /// Driver name.
     pub const NAME: &'static str = "builtin";
 
-    /// Build the driver.
+    /// Build the driver over the gateway's store.
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
     }
 }
 
@@ -71,12 +97,14 @@ impl PolicyDriver for BuiltinPolicyDriver {
 
     async fn effective_policy(
         &self,
-        _request: PolicyRequest<'_>,
-    ) -> Result<Option<SandboxPolicy>, PolicyError> {
-        // Policy composition is handled in the sandbox-config request path.
-        Err(PolicyError::Message(
-            "builtin policy composition is handled in the sandbox-config path".into(),
-        ))
+        request: PolicyRequest<'_>,
+    ) -> Result<EffectivePolicy, PolicyError> {
+        crate::grpc::policy::compose_effective_policy_for_sandbox(
+            self.store.as_ref(),
+            request.sandbox,
+        )
+        .await
+        .map_err(|status| PolicyError::Message(status.message().to_string()))
     }
 }
 
@@ -127,32 +155,66 @@ impl PolicyResolver {
 
 /// Select the policy driver for the given accepted surfaces.
 #[must_use]
-pub fn resolve_policy_driver(_accepted_surfaces: &[String]) -> Arc<dyn PolicyDriver> {
-    Arc::new(BuiltinPolicyDriver::new())
+pub fn resolve_policy_driver(
+    _accepted_surfaces: &[String],
+    store: Arc<Store>,
+) -> Arc<dyn PolicyDriver> {
+    Arc::new(BuiltinPolicyDriver::new(store))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::test_store;
+    use openshell_core::proto::{Sandbox, SandboxPolicy, SandboxSpec};
 
-    #[test]
-    fn factory_returns_builtin_driver() {
-        let driver = resolve_policy_driver(&[]);
+    #[tokio::test]
+    async fn factory_returns_builtin_driver() {
+        let store = Arc::new(test_store().await);
+        let driver = resolve_policy_driver(&[], store);
         assert_eq!(driver.name(), BuiltinPolicyDriver::NAME);
         assert_eq!(driver.name(), "builtin");
     }
 
-    #[test]
-    fn coordinator_exposes_accepted_surfaces_and_driver_name() {
+    #[tokio::test]
+    async fn coordinator_exposes_accepted_surfaces_and_driver_name() {
+        let store = Arc::new(test_store().await);
         let surfaces = vec!["openshell.sandbox.v1".to_string()];
-        let resolver = PolicyResolver::new(resolve_policy_driver(&surfaces), surfaces.clone());
+        let resolver =
+            PolicyResolver::new(resolve_policy_driver(&surfaces, store), surfaces.clone());
         assert_eq!(resolver.accepted_surfaces(), surfaces.as_slice());
         assert_eq!(resolver.driver_name(), "builtin");
     }
 
-    #[test]
-    fn coordinator_default_has_no_accepted_surfaces() {
-        let resolver = PolicyResolver::new(resolve_policy_driver(&[]), Vec::new());
+    #[tokio::test]
+    async fn coordinator_default_has_no_accepted_surfaces() {
+        let store = Arc::new(test_store().await);
+        let resolver = PolicyResolver::new(resolve_policy_driver(&[], store), Vec::new());
         assert!(resolver.accepted_surfaces().is_empty());
+    }
+
+    #[tokio::test]
+    async fn builtin_driver_serves_sandbox_spec_policy() {
+        let store = Arc::new(test_store().await);
+        let policy = SandboxPolicy {
+            version: 3,
+            ..Default::default()
+        };
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                policy: Some(policy.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let driver = BuiltinPolicyDriver::new(store);
+        let effective = driver
+            .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+            .await
+            .expect("effective policy");
+        assert_eq!(effective.policy, Some(policy));
+        assert_eq!(effective.version, 1);
+        assert_eq!(effective.policy_source, PolicySource::Sandbox);
+        assert!(!effective.policy_hash.is_empty());
     }
 }

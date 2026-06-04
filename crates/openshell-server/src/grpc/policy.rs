@@ -13,6 +13,7 @@
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
+use crate::policy::{EffectivePolicy, PolicyRequest};
 use crate::policy_store::PolicyStoreExt;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
@@ -1086,20 +1087,16 @@ async fn resolve_sandbox_by_name_for_principal(
 // Config handlers
 // ---------------------------------------------------------------------------
 
-pub(super) async fn handle_get_sandbox_config(
-    state: &Arc<ServerState>,
-    request: Request<GetSandboxConfigRequest>,
-) -> Result<Response<GetSandboxConfigResponse>, Status> {
-    let sandbox_id = request.get_ref().sandbox_id.clone();
-    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
-    drop(request);
-
-    let sandbox = state
-        .store
-        .get_message::<Sandbox>(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+/// Resolve the effective policy for a sandbox from the store.
+///
+/// Reads the latest revision (backfilling version 1 from the spec when no
+/// history exists), applies the global policy overlay, and composes provider
+/// policy layers when providers v2 is enabled.
+pub async fn compose_effective_policy_for_sandbox(
+    store: &Store,
+    sandbox: &Sandbox,
+) -> Result<EffectivePolicy, Status> {
+    let sandbox_id = sandbox.object_id();
     let sandbox_provider_names = sandbox
         .spec
         .as_ref()
@@ -1107,9 +1104,8 @@ pub(super) async fn handle_get_sandbox_config(
         .unwrap_or_default();
 
     // Try to get the latest policy from the policy history table.
-    let latest = state
-        .store
-        .get_latest_policy(&sandbox_id)
+    let latest = store
+        .get_latest_policy(sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
 
@@ -1147,9 +1143,8 @@ pub(super) async fn handle_get_sandbox_config(
                 let payload = spec_policy.encode_to_vec();
                 let policy_id = uuid::Uuid::new_v4().to_string();
 
-                if let Err(e) = state
-                    .store
-                    .put_policy_revision(&policy_id, &sandbox_id, 1, &payload, &hash)
+                if let Err(e) = store
+                    .put_policy_revision(&policy_id, sandbox_id, 1, &payload, &hash)
                     .await
                 {
                     warn!(
@@ -1157,9 +1152,8 @@ pub(super) async fn handle_get_sandbox_config(
                         error = %e,
                         "Failed to backfill policy version 1"
                     );
-                } else if let Err(e) = state
-                    .store
-                    .update_policy_status(&sandbox_id, 1, "loaded", None, None)
+                } else if let Err(e) = store
+                    .update_policy_status(sandbox_id, 1, "loaded", None, None)
                     .await
                 {
                     warn!(
@@ -1179,9 +1173,7 @@ pub(super) async fn handle_get_sandbox_config(
         }
     };
 
-    let global_settings = load_global_settings(state.store.as_ref()).await?;
-    let sandbox_settings =
-        load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
+    let global_settings = load_global_settings(store).await?;
     let providers_v2_enabled =
         bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
 
@@ -1194,11 +1186,7 @@ pub(super) async fn handle_get_sandbox_config(
         if version == 0 {
             version = 1;
         }
-        if let Ok(Some(global_rev)) = state
-            .store
-            .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
-            .await
-        {
+        if let Ok(Some(global_rev)) = store.get_latest_policy(GLOBAL_POLICY_SANDBOX_ID).await {
             global_policy_version = u32::try_from(global_rev.version).unwrap_or(0);
         }
     }
@@ -1208,13 +1196,59 @@ pub(super) async fn handle_get_sandbox_config(
         && let Some(source_policy) = policy.as_ref()
     {
         let provider_layers =
-            profile_provider_policy_layers(state.store.as_ref(), &sandbox_provider_names).await?;
+            profile_provider_policy_layers(store, &sandbox_provider_names).await?;
         if !provider_layers.is_empty() {
             let effective_policy = compose_effective_policy(source_policy, &provider_layers);
             policy_hash = deterministic_policy_hash(&effective_policy);
             policy = Some(effective_policy);
         }
     }
+
+    Ok(EffectivePolicy {
+        policy,
+        version,
+        policy_hash,
+        policy_source,
+        global_policy_version,
+    })
+}
+
+pub(super) async fn handle_get_sandbox_config(
+    state: &Arc<ServerState>,
+    request: Request<GetSandboxConfigRequest>,
+) -> Result<Response<GetSandboxConfigResponse>, Status> {
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    drop(request);
+
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox_provider_names = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.clone())
+        .unwrap_or_default();
+
+    let EffectivePolicy {
+        policy,
+        version,
+        policy_hash,
+        policy_source,
+        global_policy_version,
+    } = state
+        .policy
+        .driver()
+        .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let sandbox_settings =
+        load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
 
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
     let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
