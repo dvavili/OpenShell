@@ -166,7 +166,25 @@ pub fn resolve_policy_driver(
 mod tests {
     use super::*;
     use crate::persistence::test_store;
+    use crate::policy_store::PolicyStoreExt;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{Sandbox, SandboxPolicy, SandboxSpec};
+    use prost::Message;
+
+    fn sandbox_with_spec(id: &str, policy: Option<SandboxPolicy>) -> Sandbox {
+        Sandbox {
+            metadata: Some(ObjectMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                ..Default::default()
+            }),
+            spec: Some(SandboxSpec {
+                policy,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
 
     #[tokio::test]
     async fn factory_returns_builtin_driver() {
@@ -216,5 +234,92 @@ mod tests {
         assert_eq!(effective.version, 1);
         assert_eq!(effective.policy_source, PolicySource::Sandbox);
         assert!(!effective.policy_hash.is_empty());
+    }
+
+    #[tokio::test]
+    async fn builtin_driver_serves_latest_stored_revision() {
+        let store = Arc::new(test_store().await);
+        let sandbox = sandbox_with_spec("sb-history", None);
+
+        let stored = SandboxPolicy {
+            version: 7,
+            ..Default::default()
+        };
+        store
+            .put_policy_revision(
+                "rev-3",
+                "sb-history",
+                3,
+                &stored.encode_to_vec(),
+                "hash-rev-3",
+            )
+            .await
+            .expect("seed revision");
+
+        let driver = BuiltinPolicyDriver::new(store);
+        let effective = driver
+            .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+            .await
+            .expect("effective policy");
+
+        assert_eq!(effective.policy, Some(stored));
+        assert_eq!(effective.version, 3);
+        assert_eq!(effective.policy_hash, "hash-rev-3");
+        assert_eq!(effective.policy_source, PolicySource::Sandbox);
+    }
+
+    #[tokio::test]
+    async fn builtin_driver_backfills_spec_policy_as_revision_one() {
+        let store = Arc::new(test_store().await);
+        let policy = SandboxPolicy {
+            version: 4,
+            ..Default::default()
+        };
+        let sandbox = sandbox_with_spec("sb-backfill", Some(policy.clone()));
+
+        assert!(
+            store
+                .get_latest_policy("sb-backfill")
+                .await
+                .expect("query history")
+                .is_none()
+        );
+
+        let driver = BuiltinPolicyDriver::new(store.clone());
+        let effective = driver
+            .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+            .await
+            .expect("effective policy");
+
+        assert_eq!(effective.version, 1);
+        assert_eq!(effective.policy, Some(policy.clone()));
+
+        let backfilled = store
+            .get_latest_policy("sb-backfill")
+            .await
+            .expect("query history")
+            .expect("revision one is written");
+        assert_eq!(backfilled.version, 1);
+        assert_eq!(backfilled.policy_hash, effective.policy_hash);
+        let decoded = SandboxPolicy::decode(backfilled.policy_payload.as_slice())
+            .expect("decode backfilled policy");
+        assert_eq!(decoded, policy);
+    }
+
+    #[tokio::test]
+    async fn builtin_driver_returns_empty_when_no_policy() {
+        let store = Arc::new(test_store().await);
+        let sandbox = sandbox_with_spec("sb-empty", None);
+
+        let driver = BuiltinPolicyDriver::new(store);
+        let effective = driver
+            .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+            .await
+            .expect("effective policy");
+
+        assert_eq!(effective.policy, None);
+        assert_eq!(effective.version, 0);
+        assert!(effective.policy_hash.is_empty());
+        assert_eq!(effective.policy_source, PolicySource::Sandbox);
     }
 }

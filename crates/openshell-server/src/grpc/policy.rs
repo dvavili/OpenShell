@@ -5308,6 +5308,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builtin_driver_overlays_global_policy() {
+        use crate::policy::PolicyDriver;
+
+        let state = test_server_state().await;
+        let sandbox = test_sandbox(
+            "sb-driver-global",
+            "driver-global",
+            test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+            Vec::new(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let global_policy = test_policy_with_rule("global_only", "global.example.com");
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                POLICY_SETTING_KEY.to_string(),
+                StoredSettingValue::Bytes(hex::encode(global_policy.encode_to_vec())),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "global-rev",
+                GLOBAL_POLICY_SANDBOX_ID,
+                5,
+                &global_policy.encode_to_vec(),
+                &deterministic_policy_hash(&global_policy),
+            )
+            .await
+            .unwrap();
+
+        let driver = crate::policy::BuiltinPolicyDriver::new(state.store.clone());
+        let effective = driver
+            .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+            .await
+            .unwrap();
+
+        let policy = effective.policy.expect("global policy is returned");
+        assert!(policy.network_policies.contains_key("global_only"));
+        assert!(!policy.network_policies.contains_key("sandbox_only"));
+        assert_eq!(effective.policy_source, PolicySource::Global);
+        assert_eq!(effective.global_policy_version, 5);
+        assert_eq!(
+            effective.policy_hash,
+            deterministic_policy_hash(&global_policy)
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_driver_composes_provider_layers_when_v2_enabled() {
+        use crate::policy::PolicyDriver;
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let sandbox = test_sandbox(
+            "sb-driver-v2",
+            "driver-v2",
+            test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+            vec!["work-github".to_string()],
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let base_hash = deterministic_policy_hash(&test_policy_with_rule(
+            "sandbox_only",
+            "sandbox.example.com",
+        ));
+
+        let driver = crate::policy::BuiltinPolicyDriver::new(state.store.clone());
+        let effective = driver
+            .effective_policy(PolicyRequest::for_sandbox(&sandbox))
+            .await
+            .unwrap();
+
+        let policy = effective.policy.expect("composed policy is returned");
+        assert!(policy.network_policies.contains_key("sandbox_only"));
+        assert!(
+            policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+        assert_eq!(effective.policy_source, PolicySource::Sandbox);
+        assert_eq!(effective.policy_hash, deterministic_policy_hash(&policy));
+        assert_ne!(effective.policy_hash, base_hash);
+    }
+
+    #[tokio::test]
     async fn sandbox_policy_backfill_on_update_when_no_baseline() {
         use openshell_core::proto::{FilesystemPolicy, LandlockPolicy, SandboxPhase, SandboxSpec};
 
