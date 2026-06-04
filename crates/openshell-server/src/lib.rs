@@ -30,6 +30,7 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
+mod policy;
 pub(crate) mod policy_store;
 mod provider_refresh;
 mod readiness;
@@ -82,6 +83,9 @@ pub struct ServerState {
 
     /// Compute orchestration over the configured driver.
     pub compute: ComputeRuntime,
+
+    /// Policy orchestration over the configured policy driver.
+    pub policy: policy::PolicyResolver,
 
     /// In-memory sandbox correlation index.
     pub sandbox_index: SandboxIndex,
@@ -164,10 +168,14 @@ impl ServerState {
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
+        // Default driver; `run_server` replaces it with the configured one.
+        let policy =
+            policy::PolicyResolver::new(policy::resolve_policy_driver(&[]), Vec::new());
         Self {
             config,
             store,
             compute,
+            policy,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
@@ -238,6 +246,14 @@ pub async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
+    // Select the policy driver and log the active one.
+    let policy_accepted_surfaces: Vec<String> = Vec::new();
+    let policy = policy::PolicyResolver::new(
+        policy::resolve_policy_driver(&policy_accepted_surfaces),
+        policy_accepted_surfaces,
+    );
+    info!(driver = %policy.driver_name(), "Using policy driver");
+
     let mut state = ServerState::new(
         config.clone(),
         store.clone(),
@@ -248,6 +264,7 @@ pub async fn run_server(
         supervisor_sessions,
         oidc_cache,
     );
+    state.policy = policy;
 
     // Load the gateway-minted sandbox JWT signing key when configured.
     // Optional so single-driver dev deployments without certgen continue
