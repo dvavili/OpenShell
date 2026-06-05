@@ -308,9 +308,14 @@ impl PolicyDriver for ExternalPolicyDriver {
         let policy = SandboxPolicy::decode(projection.body.as_slice())
             .map_err(|e| PolicyError::Projection(format!("decode projection body failed: {e}")))?;
 
+        // The driver has no OpenShell store revision; surface its
+        // authority-side `policy_version` (e.g. a bundle counter) as the
+        // effective version. 0 when the driver has no version concept.
+        let version = u32::try_from(projection.policy_version).unwrap_or(u32::MAX);
+
         Ok(EffectivePolicy {
             policy: Some(policy),
-            version: 0,
+            version,
             policy_hash: projection.policy_digest,
             policy_source: PolicySource::Sandbox,
             global_policy_version: 0,
@@ -798,6 +803,7 @@ mod tests {
                 Ok(Response::new(GetProjectionResponse {
                     projection: Some(Projection {
                         surface_id: TEST_SURFACE.to_string(),
+                        policy_version: 42,
                         policy_digest: digest,
                         body,
                         signature: None,

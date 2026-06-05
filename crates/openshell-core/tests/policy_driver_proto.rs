@@ -14,6 +14,7 @@ fn projection_round_trips_with_signature_and_audit_context() {
 
     let original = Projection {
         surface_id: "openshell.sandbox.v1".to_string(),
+        policy_version: 7,
         policy_digest: "deadbeef".to_string(),
         body: vec![1, 2, 3, 4],
         signature: Some(vec![9, 8, 7]),
@@ -31,6 +32,7 @@ fn projection_round_trips_with_signature_and_audit_context() {
 fn projection_round_trips_without_signature_fields() {
     let original = Projection {
         surface_id: "openshell.sandbox.v1".to_string(),
+        policy_version: 0,
         policy_digest: "deadbeef".to_string(),
         body: vec![1, 2, 3, 4],
         signature: None,

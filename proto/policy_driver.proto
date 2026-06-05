@@ -94,16 +94,20 @@ message ReleaseHandleResponse {}
 message Projection {
   // Schema `body` conforms to, e.g. "openshell.sandbox.v1".
   string surface_id = 1;
+  // Authority-side version of the policy (e.g. a bundle counter). Advances
+  // when the driver's source policy changes; 0 when the driver has no version
+  // concept. A relying party may surface it as the effective policy version.
+  uint64 policy_version = 2;
   // Hex SHA-256 over `body`.
-  string policy_digest = 2;
+  string policy_digest = 3;
   // Serialized policy the supervisor enforces. The exact bytes `policy_digest`
   // covers; the gateway relays them unaltered.
-  bytes body = 3;
+  bytes body = 4;
   // Signature over the envelope. Present only for signing drivers.
-  optional bytes signature = 4;
+  optional bytes signature = 5;
   // Names the trust-store key the signature is verified under. Present only
   // when `signature` is set.
-  optional string signing_key_id = 5;
+  optional string signing_key_id = 6;
   // Opaque key-value pairs the gateway records verbatim for audit correlation.
-  map<string, string> audit_context = 6;
+  map<string, string> audit_context = 7;
 }
