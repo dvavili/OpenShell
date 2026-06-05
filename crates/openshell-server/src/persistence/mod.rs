@@ -26,6 +26,14 @@ pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
 /// Object type string for policy-driver handle records, keyed by sandbox id.
 pub const POLICY_HANDLE_OBJECT_TYPE: &str = "policy_handle";
 
+/// Row id for a policy-handle record. The `objects` table uses `id` as a
+/// global primary key, so the handle row must not reuse the sandbox id
+/// verbatim — that would collide with the sandbox's own record. Namespacing
+/// keeps the two rows distinct.
+fn policy_handle_row_id(sandbox_id: &str) -> String {
+    format!("{POLICY_HANDLE_OBJECT_TYPE}:{sandbox_id}")
+}
+
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
 /// Persistence-layer error type.
@@ -376,10 +384,11 @@ impl Store {
 
     /// Persist the policy-driver handle bound to a sandbox.
     pub async fn put_policy_handle(&self, sandbox_id: &str, handle: &str) -> PersistenceResult<()> {
+        let row_id = policy_handle_row_id(sandbox_id);
         self.put_if(
             POLICY_HANDLE_OBJECT_TYPE,
-            sandbox_id,
-            sandbox_id,
+            &row_id,
+            &row_id,
             handle.as_bytes(),
             None,
             WriteCondition::Unconditional,
@@ -390,7 +399,9 @@ impl Store {
 
     /// Fetch the policy-driver handle bound to a sandbox, if any.
     pub async fn get_policy_handle(&self, sandbox_id: &str) -> PersistenceResult<Option<String>> {
-        let record = self.get(POLICY_HANDLE_OBJECT_TYPE, sandbox_id).await?;
+        let record = self
+            .get(POLICY_HANDLE_OBJECT_TYPE, &policy_handle_row_id(sandbox_id))
+            .await?;
         match record {
             Some(record) => String::from_utf8(record.payload)
                 .map(Some)
@@ -402,7 +413,8 @@ impl Store {
     /// Delete the policy-driver handle bound to a sandbox. Returns whether a
     /// record was removed.
     pub async fn delete_policy_handle(&self, sandbox_id: &str) -> PersistenceResult<bool> {
-        self.delete(POLICY_HANDLE_OBJECT_TYPE, sandbox_id).await
+        self.delete(POLICY_HANDLE_OBJECT_TYPE, &policy_handle_row_id(sandbox_id))
+            .await
     }
 
     // -----------------------------------------------------------------------

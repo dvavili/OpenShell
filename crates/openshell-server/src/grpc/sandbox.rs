@@ -228,7 +228,18 @@ async fn handle_create_sandbox_inner(
             Status::failed_precondition(format!("policy driver could not admit sandbox: {e}"))
         })?;
 
-    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
+    // Release the handle if the sandbox does not get created (e.g. a name
+    // collision or driver failure), so a failed create does not leak
+    // per-sandbox state on the policy driver. Release is idempotent.
+    let sandbox = match state.compute.create_sandbox(sandbox, sandbox_token).await {
+        Ok(sandbox) => sandbox,
+        Err(status) => {
+            if let Err(e) = state.policy.driver().release_handle(&id).await {
+                warn!(sandbox_id = %id, error = %e, "failed to release policy handle after create failure");
+            }
+            return Err(status);
+        }
+    };
 
     info!(
         sandbox_id = %id,
