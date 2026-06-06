@@ -261,6 +261,7 @@ pub async fn run_server(
         Some(socket) => policy::connect_external_policy_driver(
             socket,
             &policy_config.accepted_surfaces,
+            policy_config.trust_store.as_deref(),
             store.clone(),
         )
         .await

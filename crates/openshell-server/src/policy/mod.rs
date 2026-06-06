@@ -298,13 +298,6 @@ impl PolicyDriver for ExternalPolicyDriver {
             )));
         }
 
-        if projection.signature.is_some() {
-            tracing::warn!(
-                sandbox_id = %sandbox_id,
-                "policy projection carries a signature but signature verification is not enabled"
-            );
-        }
-
         let policy = SandboxPolicy::decode(projection.body.as_slice())
             .map_err(|e| PolicyError::Projection(format!("decode projection body failed: {e}")))?;
 
@@ -473,6 +466,7 @@ pub fn resolve_policy_driver(
 pub async fn connect_external_policy_driver(
     driver_socket: &Path,
     accepted_surfaces: &[String],
+    trust_store: Option<&Path>,
     store: Arc<Store>,
 ) -> Result<Arc<dyn PolicyDriver>, PolicyError> {
     let socket = driver_socket.to_path_buf();
@@ -511,6 +505,13 @@ pub async fn connect_external_policy_driver(
             supported: capabilities.supported_surfaces,
             accepted: accepted_surfaces.to_vec(),
         });
+    }
+
+    // Without a trust store the gateway cannot verify projection signatures.
+    if trust_store.is_none() {
+        tracing::warn!(
+            "policy trust store not configured; driver projections cannot be verified or attested"
+        );
     }
 
     Ok(Arc::new(ExternalPolicyDriver {
@@ -881,7 +882,7 @@ mod tests {
 
             let accepted = vec!["openshell.sandbox.v1".to_string()];
             let store = Arc::new(test_store().await);
-            let driver = connect_external_policy_driver(&socket, &accepted, store)
+            let driver = connect_external_policy_driver(&socket, &accepted, None, store)
                 .await
                 .expect("driver connects");
             assert_eq!(driver.name(), "external");
@@ -902,7 +903,7 @@ mod tests {
 
             let accepted = vec!["openshell.sandbox.v1".to_string()];
             let store = Arc::new(test_store().await);
-            match connect_external_policy_driver(&socket, &accepted, store).await {
+            match connect_external_policy_driver(&socket, &accepted, None, store).await {
                 Err(PolicyError::NoSurfaceOverlap { .. }) => {}
                 Ok(_) => panic!("expected no-overlap error, driver connected"),
                 Err(other) => panic!("expected no-overlap error, got {other:?}"),
@@ -918,7 +919,7 @@ mod tests {
             let server = spawn_driver(&socket, vec!["openshell.sandbox.v1".to_string()], true);
 
             let store = Arc::new(test_store().await);
-            match connect_external_policy_driver(&socket, &[], store).await {
+            match connect_external_policy_driver(&socket, &[], None, store).await {
                 Err(PolicyError::NoSurfaceOverlap { .. }) => {}
                 Ok(_) => panic!("expected no-overlap error, driver connected"),
                 Err(other) => panic!("expected no-overlap error, got {other:?}"),
@@ -935,7 +936,7 @@ mod tests {
 
             let accepted = vec!["openshell.sandbox.v1".to_string()];
             let store = Arc::new(test_store().await);
-            match connect_external_policy_driver(&socket, &accepted, store).await {
+            match connect_external_policy_driver(&socket, &accepted, None, store).await {
                 Err(PolicyError::Connect { .. }) => {}
                 Ok(_) => panic!("expected connect error, driver connected"),
                 Err(other) => panic!("expected connect error, got {other:?}"),
@@ -949,7 +950,7 @@ mod tests {
 
             let accepted = vec!["openshell.sandbox.v1".to_string()];
             let store = Arc::new(test_store().await);
-            let driver = connect_external_policy_driver(&socket, &accepted, store)
+            let driver = connect_external_policy_driver(&socket, &accepted, None, store)
                 .await
                 .expect("driver connects");
             assert!(!driver.permits_mutation());
@@ -972,7 +973,7 @@ mod tests {
             let server = spawn_driver_double(&socket, DriverDouble::projecting(body.clone()));
 
             let accepted = vec![TEST_SURFACE.to_string()];
-            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+            let driver = connect_external_policy_driver(&socket, &accepted, None, store.clone())
                 .await
                 .expect("driver connects");
 
@@ -1017,7 +1018,7 @@ mod tests {
             let accepted = vec![TEST_SURFACE.to_string()];
 
             {
-                let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+                let driver = connect_external_policy_driver(&socket, &accepted, None, store.clone())
                     .await
                     .expect("driver connects");
                 driver
@@ -1031,7 +1032,7 @@ mod tests {
 
             // A fresh driver instance (gateway restart) never re-acquires; it
             // resolves the projection from the persisted handle.
-            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+            let driver = connect_external_policy_driver(&socket, &accepted, None, store.clone())
                 .await
                 .expect("driver reconnects");
             let sandbox = sandbox_with_spec("sb-restart", None);
@@ -1054,7 +1055,7 @@ mod tests {
             let server = spawn_driver_double(&socket, DriverDouble::projecting(body));
             let accepted = vec![TEST_SURFACE.to_string()];
 
-            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+            let driver = connect_external_policy_driver(&socket, &accepted, None, store.clone())
                 .await
                 .expect("driver connects");
             driver
@@ -1094,7 +1095,7 @@ mod tests {
             let server = spawn_driver_double(&socket, DriverDouble::no_verified_policy());
             let accepted = vec![TEST_SURFACE.to_string()];
 
-            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+            let driver = connect_external_policy_driver(&socket, &accepted, None, store.clone())
                 .await
                 .expect("driver connects");
             driver
@@ -1129,7 +1130,7 @@ mod tests {
             let server = spawn_driver_double(&socket, double);
             let accepted = vec![TEST_SURFACE.to_string()];
 
-            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+            let driver = connect_external_policy_driver(&socket, &accepted, None, store.clone())
                 .await
                 .expect("driver connects");
             driver
@@ -1161,7 +1162,7 @@ mod tests {
             let server = spawn_driver_double(&socket, DriverDouble::failing_acquire());
             let accepted = vec![TEST_SURFACE.to_string()];
 
-            let driver = connect_external_policy_driver(&socket, &accepted, store.clone())
+            let driver = connect_external_policy_driver(&socket, &accepted, None, store.clone())
                 .await
                 .expect("driver connects");
 
